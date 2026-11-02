@@ -1,0 +1,75 @@
+# Copy to terraform.tfvars (gitignored) and fill in real values.
+# This repository is public - never commit the populated file.
+
+project_name    = "volumes"
+storage_prefix  = "vol"
+subscription_id = "REPLACE_WITH_SUBSCRIPTION_ID"
+location        = "eastus2"
+cost_center     = "REPLACE_WITH_COST_CENTER"
+
+tfstate_resource_group_name  = "volumes-tfstate-rg"
+tfstate_storage_account_name = "REPLACE_WITH_STATE_STORAGE_ACCOUNT"
+
+# Local applies authenticate with the Azure CLI, not a GitHub OIDC token.
+use_oidc = false
+
+# --- Image ---------------------------------------------------------------------
+# The gallery and the base image are owned by lib-main-infra and shared. Only
+# image_name below belongs to this project.
+use_gallery_image           = true
+gallery_name                = "lib_main_gallery"
+gallery_resource_group_name = "lib-main-images-rg"
+image_name                  = "volumes-rocky-linux-9"
+
+# image_version is deliberately NOT set here, and has no default in variables.tf.
+# Do not add it back. mccarthy-infra used to pin it with a comment warning you to
+# override it; the comment did not work -- on 2026-08-19 that production ran 0.0.7
+# while its real tfvars still said 0.0.4, so a manual apply that forgot -var would
+# have rolled the site back three builds from a normal-looking plan.
+#
+# Pass it on every manual run, matching what production is actually on:
+#   terraform plan -var="image_version=0.0.7"
+# Confirm the running version first:
+#   az vmss list-instances -g volumes-production-rg -n volumes-production-vmss \
+#     --query "[].storageProfile.imageReference.exactVersion" -o tsv
+#
+# CI always passes it explicitly. main.tf also carries a check block that warns
+# when the requested version is not the newest published to the gallery.
+
+# --- Site ----------------------------------------------------------------------
+# Do NOT generate a new UUID. Copy the `uuid` value out of the app repo's
+# config/system.site.yml -- it was created when the site was first installed and
+# captured by drush config:export. Config import fails on every deploy if these
+# disagree.
+#   volumes: f9411c09-e1c6-476c-b13e-430189fba5b8
+drupal_site_uuid = "REPLACE_WITH_UUID_FROM_APP_REPO"
+
+# Must equal the `profile:` key in the app repo's config/core.extension.yml.
+# Drupal will not let config import change the install profile.
+#   volumes: minimal   |   lib-main: standard
+drupal_install_profile = "minimal"
+
+# First-boot install identity. The defaults in variables.tf are the volumes
+# devs' choices; set these only to change them, and only before the first
+# install -- the admin account is never touched again after it.
+# drupal_site_name      = "Volumes | UTK Libraries"
+# drupal_site_mail      = "librarieswebsite@utk.edu"
+# drupal_admin_username = "admin"
+# drupal_admin_mail     = "librarieswebsite@utk.edu"
+
+domain_name  = "REPLACE_WITH_FQDN" # not chosen yet
+enable_https = true
+
+# Resource ID of an externally-managed public IP for the load balancer.
+# Leave null to have Terraform create one and use lb_dns_label instead.
+# mccarthy moved to a hand-made, locked <project>-production-pip so the address
+# survives a rebuild; do the same here before DNS points at it.
+public_ip_id = null
+lb_dns_label = "volumes"
+
+# --- Access --------------------------------------------------------------------
+admin_ssh_public_key = "REPLACE_WITH_SSH_PUBLIC_KEY"
+
+# Two-pass deployment: leave false for the very first apply (the VMSS does not
+# exist yet, so there is no principal to grant), then set true and re-apply.
+enable_vmss_blob_access = false

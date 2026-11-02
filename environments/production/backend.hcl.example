@@ -1,0 +1,14 @@
+# Terraform backend configuration for Azure Storage.
+# Copy to backend.hcl (gitignored) and fill in the storage account name that
+# bootstrap/azure-setup.sh generated.
+#
+# Run: terraform init -backend-config=backend.hcl \
+#        -backend-config="use_azuread_auth=true"
+#
+# Add -backend-config="use_oidc=true" in CI. Local runs authenticate with the
+# Azure CLI session instead.
+
+resource_group_name  = "volumes-tfstate-rg"
+storage_account_name = "REPLACE_WITH_STATE_STORAGE_ACCOUNT"
+container_name       = "tfstate"
+key                  = "production/terraform.tfstate"

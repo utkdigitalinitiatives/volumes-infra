@@ -1,0 +1,41 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Variable files may carry subscription/tenant/object IDs and SSH public keys.
+# Treat this repository as public - only the .example templates are tracked.
+*.tfvars
+!*.tfvars.example
+*.auto.tfvars
+
+# Local backend config (contains storage account names)
+backend.hcl
+!backend.hcl.example
+
+# NOTE: .terraform.lock.hcl is deliberately NOT ignored. Provider versions are
+# pinned in git so every operator and CI run resolves the same binaries.
+
+# Packer
+packer_cache/
+*.pkrvars.hcl
+!*.pkrvars.hcl.example
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log

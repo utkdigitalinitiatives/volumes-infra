@@ -1,0 +1,688 @@
+name: Build on Dispatch
+
+# Triggered by repository_dispatch from the app repository.
+# Event type: drupal-dev-merge (push to the `dev` branch in the app repo)
+#
+# Payload (client_payload):
+#   - drupal_repo: Git clone URL (logged only; the repo built is vars.APP_REPO)
+#   - drupal_ref:  Branch the push landed on (dev)
+#   - drupal_sha:  Full commit SHA. This is what gets built, not the branch tip.
+#   - bootstrap_build: "true" to build the image only, from vanilla Drupal.
+#       Omit it for every real dev-merge. See "Validate dispatch payload" below.
+#
+# The app repo is PRIVATE. The runner checks it out with a read-only deploy key
+# (secrets.APP_REPO_DEPLOY_KEY), packs that one commit with `git archive`, and
+# hands Packer the tarball. The build VM never sees a credential.
+#
+# NOTE ON CONCURRENCY: there is deliberately no workflow-level concurrency block.
+# A run-wide cancel tears down every job including deploy-dev mid-`terraform
+# apply`, which leaves an unreleasable infinite blob lease on the state file and
+# can orphan a half-replaced VM. Instead each job declares its own group below:
+# the build is safe to supersede, the apply must queue.
+
+on:
+  repository_dispatch:
+    types: [drupal-dev-merge]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # Terraform authenticates with the GitHub OIDC token. There is no
+  # ARM_CLIENT_SECRET; the service principal has no password credential.
+  ARM_USE_OIDC: true
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+
+  TF_VAR_project_name: ${{ vars.PROJECT_NAME }}
+  TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_location: ${{ vars.LOCATION }}
+  TF_VAR_cost_center: ${{ vars.COST_CENTER }}
+  TF_VAR_admin_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+  TF_VAR_gallery_name: ${{ vars.GALLERY_NAME }}
+  TF_VAR_gallery_resource_group_name: ${{ vars.GALLERY_RESOURCE_GROUP }}
+  TF_VAR_image_name: ${{ vars.APP_IMAGE_NAME }}
+  TF_VAR_subnet_id: ${{ vars.SUBNET_ID }}
+  TF_VAR_devtest_db_host: ${{ vars.DEVTEST_DB_HOST }}
+  TF_VAR_devtest_storage_account: ${{ vars.DEVTEST_STORAGE_ACCOUNT }}
+  TF_VAR_tfstate_resource_group_name: ${{ vars.TF_STATE_RESOURCE_GROUP }}
+  TF_VAR_tfstate_storage_account_name: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the app image from the app repository
+  # ---------------------------------------------------------------------------
+  build-image:
+    name: Build Image
+    runs-on: ubuntu-latest
+    # Safe to supersede: image versions are unique (0.0.{run_number}) and a
+    # cancelled build skips deploy-dev via `needs`.
+    concurrency:
+      group: dev-merge-build
+      cancel-in-progress: true
+    outputs:
+      image_version: ${{ steps.version.outputs.version }}
+      bootstrap: ${{ steps.validate.outputs.bootstrap }}
+
+    steps:
+      - name: Checkout infrastructure code
+        uses: actions/checkout@v7.0.1
+
+      - name: Validate dispatch payload
+        id: validate
+        env:
+          APP_REPO: ${{ vars.APP_REPO }}
+          DRUPAL_REPO: ${{ github.event.client_payload.drupal_repo }}
+          DRUPAL_REF: ${{ github.event.client_payload.drupal_ref }}
+          DRUPAL_SHA: ${{ github.event.client_payload.drupal_sha }}
+          BOOTSTRAP_BUILD: ${{ github.event.client_payload.bootstrap_build }}
+        run: |
+          echo "Event type: ${{ github.event.action }}"
+          echo "App repo (vars.APP_REPO): $APP_REPO"
+          echo "Drupal repo (payload): $DRUPAL_REPO"
+          echo "Drupal ref: $DRUPAL_REF"
+          echo "Drupal SHA: $DRUPAL_SHA"
+
+          # Normalise the flag to a string ONCE, here, and let the downstream jobs
+          # gate on this output rather than on client_payload directly.
+          #
+          # Both a JSON boolean true and the string "true" arrive at this shell as
+          # `true`, so the test below cannot tell them apart -- but a job-level
+          # `if:` can. GitHub coerces mismatched types to numbers before comparing,
+          # and while `true` casts to 1, the string 'true' casts to NaN. So
+          # `true != 'true'` evaluates to `1 != NaN`, which is *true*: a boolean
+          # payload would sail straight past a guard written against the string.
+          # Job outputs are always strings, so the comparison downstream is exact.
+          #
+          # Packer and the Ansible playbook fall back to `composer create-project`
+          # when they get no app tarball -- that is how the very first image gets
+          # built, before the app repo has any dispatch workflows to send a real
+          # payload. Nothing else could produce the first version of the app
+          # image definition.
+          #
+          # That fallback is actively wrong for a real dev-merge, though: it would
+          # quietly bake vanilla Drupal and ship it over the actual site. So it
+          # only happens when the caller says it meant it, and a bootstrap build
+          # ignores any repo or SHA in the payload.
+          if [ "$BOOTSTRAP_BUILD" = "true" ]; then
+            echo "bootstrap=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Bootstrap build: not using the app repo, installing vanilla Drupal via Composer."
+            exit 0
+          fi
+          echo "bootstrap=false" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$APP_REPO" ]; then
+            echo "::error::The APP_REPO repository variable is empty. Set it to owner/name of the app repo."
+            exit 1
+          fi
+
+          # A full SHA, not a branch: the image is built from exactly the commit
+          # that was pushed, even if dev has moved on by the time this runs.
+          if ! [[ "$DRUPAL_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::drupal_sha is missing or not a full 40-character commit SHA: '$DRUPAL_SHA'"
+            exit 1
+          fi
+
+      # persist-credentials: false keeps the deploy key out of app-src/.git/config.
+      # The key never leaves this runner either way, but nothing below needs it.
+      - name: Checkout app repository
+        if: steps.validate.outputs.bootstrap != 'true'
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ vars.APP_REPO }}
+          ref: ${{ github.event.client_payload.drupal_sha }}
+          ssh-key: ${{ secrets.APP_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+          path: app-src
+
+      # `git archive` packs the tracked files of one commit and nothing else: no
+      # .git directory, no remote URL, nothing untracked. That is what the image
+      # gets. tar.umask=0022 gives 644/755, as a clone would; git's default
+      # (0002) makes everything group-writable. Written outside the workspace so
+      # a later checkout cannot clean it away.
+      - name: Pack app repository
+        id: app
+        if: steps.validate.outputs.bootstrap != 'true'
+        env:
+          DRUPAL_SHA: ${{ github.event.client_payload.drupal_sha }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(git -C app-src rev-parse HEAD)
+          if [ "$HEAD_SHA" != "$DRUPAL_SHA" ]; then
+            echo "::error::Checked out $HEAD_SHA, expected $DRUPAL_SHA"
+            exit 1
+          fi
+          ARCHIVE="$RUNNER_TEMP/app.tar.gz"
+          git -C app-src -c tar.umask=0022 archive --format=tar.gz -o "$ARCHIVE" HEAD
+          echo "Packed $(tar -tzf "$ARCHIVE" | wc -l) entries, $(du -h "$ARCHIVE" | cut -f1)"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Generate version
+        id: version
+        run: |
+          echo "version=0.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "Building image version: 0.0.${{ github.run_number }}"
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@v3.4.0
+        with:
+          version: latest
+
+      - name: Azure Login
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve base image version
+        id: base_version
+        env:
+          # The base image and the gallery are SHARED with lib-main-infra, which
+          # owns and rebuilds them monthly. Set the BASE_IMAGE_VERSION repo
+          # variable to pin a known-good base instead of tracking latest.
+          PINNED: ${{ vars.BASE_IMAGE_VERSION }}
+          GALLERY: ${{ vars.GALLERY_NAME }}
+          GALLERY_RG: ${{ vars.GALLERY_RESOURCE_GROUP }}
+          BASE_IMAGE: ${{ vars.BASE_IMAGE_NAME }}
+        run: |
+          if [ -n "$PINNED" ]; then
+            echo "Using pinned base image version: $PINNED"
+            echo "version=$PINNED" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Querying the shared gallery for the newest base image..."
+          # Versions are zero-padded YYYY.MM.0, so a lexicographic sort is a
+          # correct chronological sort.
+          VERSION=$(az sig image-version list \
+            --gallery-name "$GALLERY" \
+            --gallery-image-definition "$BASE_IMAGE" \
+            --resource-group "$GALLERY_RG" \
+            --query "sort_by([].name, &@)[-1]" -o tsv)
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::No base image found in the shared gallery ($GALLERY_RG/$GALLERY/$BASE_IMAGE)."
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using base image version: $VERSION"
+
+      # This repo passes build_resource_group_name, so Packer builds inside an
+      # existing RG. A cancelled build therefore leaks loose pkrvm/pkrni/pkros
+      # resources - a build VM that keeps billing - with no pkr-* group to find.
+      # A dead build cannot tidy up after itself, so the next build does it.
+      - name: Sweep stray Packer build resources
+        run: |
+          .github/scripts/packer-cleanup.sh sweep-build-resources \
+            "${{ vars.BUILD_RESOURCE_GROUP || vars.GALLERY_RESOURCE_GROUP }}" 24
+
+      - name: Build image
+        working-directory: packer
+        env:
+          IMAGE_VERSION: ${{ steps.version.outputs.version }}
+          BASE_IMAGE_VERSION: ${{ steps.base_version.outputs.version }}
+          # Empty on a bootstrap build, which is what selects the fallback.
+          DRUPAL_ARCHIVE: ${{ steps.app.outputs.archive }}
+          DRUPAL_REPO: ${{ vars.APP_REPO }}
+          DRUPAL_REF: ${{ github.event.client_payload.drupal_ref }}
+          DRUPAL_SHA: ${{ github.event.client_payload.drupal_sha }}
+        run: |
+          packer init .
+          packer build \
+            -force \
+            -only='volumes-rocky9*' \
+            -var "subscription_id=$ARM_SUBSCRIPTION_ID" \
+            -var "use_azure_cli_auth=true" \
+            -var "site_name=${{ vars.PROJECT_NAME }}" \
+            -var "image_version=$IMAGE_VERSION" \
+            -var "base_image_name=${{ vars.BASE_IMAGE_NAME }}" \
+            -var "base_image_version=$BASE_IMAGE_VERSION" \
+            -var "gallery_resource_group_name=${{ vars.GALLERY_RESOURCE_GROUP }}" \
+            -var "gallery_name=${{ vars.GALLERY_NAME }}" \
+            -var "image_name=${{ vars.APP_IMAGE_NAME }}" \
+            -var "build_resource_group_name=${{ vars.BUILD_RESOURCE_GROUP || vars.GALLERY_RESOURCE_GROUP }}" \
+            -var "location=${{ vars.LOCATION }}" \
+            -var "replication_regions=[\"${{ vars.LOCATION }}\"]" \
+            -var "drupal_archive=$DRUPAL_ARCHIVE" \
+            -var "drupal_repo=$DRUPAL_REPO" \
+            -var "drupal_ref=$DRUPAL_REF" \
+            -var "drupal_sha=$DRUPAL_SHA" \
+            .
+
+      # Packer always leaves an intermediate managed image behind on the way to the
+      # gallery version. Nothing ever boots it, so delete it here - the published
+      # gallery version keeps its own copy. This repo cleans up after its own
+      # builds rather than relying on lib-main-infra's monthly sweep, so the
+      # cleanup lives and dies with the builds that create the mess.
+      - name: Delete intermediate managed image
+        if: always()
+        run: |
+          .github/scripts/packer-cleanup.sh delete-scratch-image \
+            "${{ vars.GALLERY_RESOURCE_GROUP }}" \
+            "${{ vars.PROJECT_NAME }}-rocky9-${{ steps.version.outputs.version }}"
+
+      - name: Build Summary
+        run: |
+          {
+            echo "## Image Build Complete"
+            echo ""
+            echo "**Event Type:** ${{ github.event.action }}"
+            echo "**Image Version:** ${{ steps.version.outputs.version }}"
+            echo "**Base Image Version:** ${{ steps.base_version.outputs.version }}"
+            echo "**Drupal Repo:** ${{ steps.validate.outputs.bootstrap == 'true' && 'none (bootstrap build)' || vars.APP_REPO }}"
+            echo "**Drupal Ref:** ${{ github.event.client_payload.drupal_ref }}"
+            echo "**Drupal SHA:** ${{ github.event.client_payload.drupal_sha }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Sync the production database into devtest
+  # ---------------------------------------------------------------------------
+  prepare-database:
+    name: Prepare Database
+    needs: build-image
+    # A bootstrap build stops at the image. Everything below this point reads
+    # from production, which does not exist yet when the first image is built.
+    # Gate on the normalised job output, never on client_payload directly -- see
+    # the type-coercion note in build-image's validate step.
+    if: ${{ needs.build-image.outputs.bootstrap != 'true' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: devtest-database
+      cancel-in-progress: false
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Start PostgreSQL if stopped
+        env:
+          SERVER_NAME: ${{ vars.PROJECT_NAME }}-devtest-psql
+          RG: ${{ vars.PROJECT_NAME }}-devtest-rg
+        run: |
+          # Query server state with retries (the Azure API returns transient
+          # GatewayTimeouts against a deallocated Flexible Server).
+          STATE=""
+          for attempt in {1..5}; do
+            STATE=$(az postgres flexible-server show \
+              --name "$SERVER_NAME" --resource-group "$RG" \
+              --query "state" -o tsv 2>&1) && break
+            echo "Failed to query PostgreSQL state (attempt $attempt/5): $STATE"
+            sleep 15
+          done
+
+          if [ -z "$STATE" ] || echo "$STATE" | grep -qi "error"; then
+            echo "::error::Unable to query PostgreSQL server state after 5 attempts: $STATE"
+            exit 1
+          fi
+
+          echo "Current PostgreSQL state: $STATE"
+
+          if [ "$STATE" != "Ready" ]; then
+            echo "Starting PostgreSQL server..."
+            az postgres flexible-server start --name "$SERVER_NAME" --resource-group "$RG"
+
+            for i in {1..60}; do
+              STATE=$(az postgres flexible-server show \
+                --name "$SERVER_NAME" --resource-group "$RG" \
+                --query "state" -o tsv)
+              if [ "$STATE" == "Ready" ]; then
+                echo "PostgreSQL is ready (attempt $i)"
+                break
+              fi
+              echo "Waiting for PostgreSQL... (attempt $i/60, state: $STATE)"
+              sleep 10
+            done
+
+            if [ "$STATE" != "Ready" ]; then
+              echo "::error::PostgreSQL failed to start after 10 minutes"
+              exit 1
+            fi
+          fi
+
+      # The OIDC token from the job's first azure/login is valid for 5 minutes,
+      # and az needs it again to reach Key Vault (a new resource). Log in again
+      # so this step does not fail with AADSTS700024. See docs/TODO.md.
+      - name: Azure Login (refresh before Key Vault)
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sync production database to devtest
+        env:
+          PGSSLMODE: require
+          PROD_HOST: ${{ vars.PROD_DB_HOST }}
+          DEVTEST_HOST: ${{ vars.DEVTEST_DB_HOST }}
+          DB_USER: ${{ vars.DB_ADMIN_USERNAME }}
+          DB_NAME: ${{ vars.DB_NAME }}
+          SECRETS_RG: ${{ vars.PROJECT_NAME }}-secrets-rg
+          PG_MAJOR: ${{ vars.PG_MAJOR || '18' }}
+        run: |
+          # Install the client from PGDG pinned to the server's major version.
+          # Ubuntu 24.04 ships client 16, and pg_dump hard-refuses to read a server
+          # with a newer major than itself (no override; --ignore-version is long
+          # gone), so the distro default cannot dump our PostgreSQL 18 servers.
+          #
+          # PG_MAJOR is the single source of truth: it also feeds
+          # TF_VAR_postgresql_version in the production deploys, so the client and
+          # the server cannot drift apart. Its fallback mirrors the Terraform
+          # default in modules/postgresql/variables.tf.
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --yes --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          echo "deb https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "postgresql-client-${PG_MAJOR}"
+
+          # Call the versioned binaries, not /usr/bin's pg_wrapper, and prove the
+          # major. dump-production-db.yml explains the trap this avoids.
+          export PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:$PATH"
+          ACTUAL=$(pg_dump --version | awk '{print $3}' | cut -d. -f1)
+          if [ "$ACTUAL" != "$PG_MAJOR" ]; then
+            echo "::error::pg_dump reports major $ACTUAL, expected $PG_MAJOR."
+            exit 1
+          fi
+
+          # The two servers have SEPARATE admin passwords. An earlier version of
+          # this step fetched production's and used it for both, which failed
+          # mccarthy-infra's first end-to-end run on 2026-08-10 with "password authentication
+          # failed for user drupaladmin" against devtest -- after the production
+          # dump had already succeeded, which is what made it look like a devtest
+          # outage rather than a credential mix-up. bootstrap-runbook.md has
+          # always generated two secrets; only this step assumed otherwise.
+          KV_NAME=$(az keyvault list -g "$SECRETS_RG" --query "[0].name" -o tsv)
+          PROD_DB_PASSWORD=$(az keyvault secret show --vault-name "$KV_NAME" \
+            --name production-db-admin-password --query value -o tsv)
+          DEVTEST_DB_PASSWORD=$(az keyvault secret show --vault-name "$KV_NAME" \
+            --name devtest-db-admin-password --query value -o tsv)
+          echo "::add-mask::$PROD_DB_PASSWORD"
+          echo "::add-mask::$DEVTEST_DB_PASSWORD"
+
+          echo "Dumping production database..."
+          PGPASSWORD="$PROD_DB_PASSWORD" \
+            pg_dump -h "$PROD_HOST" -U "$DB_USER" -d "$DB_NAME" \
+            --format=custom --no-owner --no-acl -f /tmp/production.dump
+
+          # Everything below targets devtest, so switch credentials once here.
+          export PGPASSWORD="$DEVTEST_DB_PASSWORD"
+
+          echo "Terminating existing connections to the devtest database..."
+          psql -h "$DEVTEST_HOST" -U "$DB_USER" -d postgres \
+            -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$DB_NAME' AND pid <> pg_backend_pid();" || true
+
+          echo "Dropping and recreating the devtest database..."
+          psql -h "$DEVTEST_HOST" -U "$DB_USER" -d postgres -c "DROP DATABASE IF EXISTS $DB_NAME;"
+          psql -h "$DEVTEST_HOST" -U "$DB_USER" -d postgres -c "CREATE DATABASE $DB_NAME;"
+
+          echo "Restoring the production dump into devtest..."
+          pg_restore -h "$DEVTEST_HOST" -U "$DB_USER" -d "$DB_NAME" \
+            --no-owner --no-acl /tmp/production.dump
+
+          echo "Ensuring the pg_trgm extension exists..."
+          psql -h "$DEVTEST_HOST" -U "$DB_USER" -d "$DB_NAME" \
+            -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+
+          echo "Database sync complete"
+          rm -f /tmp/production.dump
+
+  # ---------------------------------------------------------------------------
+  # Sync production blob media into devtest
+  # ---------------------------------------------------------------------------
+  sync-blob-storage:
+    name: Sync Blob Storage
+    needs: build-image
+    if: ${{ needs.build-image.outputs.bootstrap != 'true' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: devtest-blob-storage
+      cancel-in-progress: false
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Generate SAS tokens
+        id: sas
+        env:
+          PROD_SA: ${{ vars.PROD_STORAGE_ACCOUNT }}
+          DEVTEST_SA: ${{ vars.DEVTEST_STORAGE_ACCOUNT }}
+        run: |
+          EXPIRY=$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%MZ')
+
+          PROD_SAS=$(az storage account generate-sas \
+            --account-name "$PROD_SA" \
+            --permissions rl --resource-types co --services b \
+            --expiry "$EXPIRY" -o tsv)
+          echo "::add-mask::$PROD_SAS"
+          echo "prod_sas=$PROD_SAS" >> "$GITHUB_OUTPUT"
+
+          DEVTEST_SAS=$(az storage account generate-sas \
+            --account-name "$DEVTEST_SA" \
+            --permissions rwdlac --resource-types co --services b \
+            --expiry "$EXPIRY" -o tsv)
+          echo "::add-mask::$DEVTEST_SAS"
+          echo "devtest_sas=$DEVTEST_SAS" >> "$GITHUB_OUTPUT"
+
+      - name: Sync blobs from production to devtest
+        env:
+          PROD_SA: ${{ vars.PROD_STORAGE_ACCOUNT }}
+          DEVTEST_SA: ${{ vars.DEVTEST_STORAGE_ACCOUNT }}
+          CONTAINER: ${{ vars.MEDIA_CONTAINER }}
+        run: |
+          azcopy sync \
+            "https://${PROD_SA}.blob.core.windows.net/${CONTAINER}?${{ steps.sas.outputs.prod_sas }}" \
+            "https://${DEVTEST_SA}.blob.core.windows.net/${CONTAINER}?${{ steps.sas.outputs.devtest_sas }}" \
+            --recursive \
+            --delete-destination=true
+
+      - name: Sync Summary
+        run: |
+          {
+            echo "## Blob Storage Sync Complete"
+            echo ""
+            echo "**Source:** ${{ vars.PROD_STORAGE_ACCOUNT }}/${{ vars.MEDIA_CONTAINER }}"
+            echo "**Destination:** ${{ vars.DEVTEST_STORAGE_ACCOUNT }}/${{ vars.MEDIA_CONTAINER }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Deploy the shared dev VM
+  # ---------------------------------------------------------------------------
+  deploy-dev:
+    name: Deploy Dev
+    needs: [build-image, prepare-database, sync-blob-storage]
+    if: ${{ needs.build-image.outputs.bootstrap != 'true' }}
+    runs-on: ubuntu-latest
+    environment: dev
+    # Never cancelled: a superseded run QUEUES behind this one rather than
+    # killing it mid-apply. See the note at the top of this file.
+    concurrency:
+      group: dev-merge-deploy
+      cancel-in-progress: false
+    outputs:
+      dev_vm_ip: ${{ steps.outputs.outputs.public_ip }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Azure Login
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        working-directory: environments/dev
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=dev/terraform.tfstate" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform Apply
+        working-directory: environments/dev
+        run: |
+          terraform apply -auto-approve \
+            -var="image_version=${{ needs.build-image.outputs.image_version }}" \
+            -replace="module.dev_vm.azurerm_linux_virtual_machine.dev"
+
+      - name: Get Outputs
+        id: outputs
+        working-directory: environments/dev
+        run: |
+          echo "public_ip=$(terraform output -raw public_ip_address)" >> "$GITHUB_OUTPUT"
+
+      - name: Run Dev Validation Tests
+        env:
+          DEV_IP: ${{ steps.outputs.outputs.public_ip }}
+        run: |
+          # Two gates. /health is served without bootstrapping Drupal, so on
+          # mccarthy's 2026-08-13 deploy it returned 200 while a crashed
+          # config:import left every real page 500ing, and this step reported
+          # the deploy good.
+          echo "Gate 1/2: liveness at https://${DEV_IP}/health"
+          for i in {1..30}; do
+            if curl -ksf --max-time 15 "https://${DEV_IP}/health" > /dev/null; then
+              echo "  VM is serving"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::Health endpoint did not respond after 30 attempts"
+              exit 1
+            fi
+            echo "  waiting for VM... (attempt $i/30)"
+            sleep 10
+          done
+
+          # /user/login renders the full stack and is never cached. Both the
+          # status and the form marker are checked: an error page can be a 200.
+          echo "Gate 2/2: Drupal at https://${DEV_IP}/user/login"
+          BODY="$RUNNER_TEMP/login.html"
+          for i in {1..10}; do
+            CODE=$(curl -ks -o "$BODY" -w '%{http_code}' --max-time 20 "https://${DEV_IP}/user/login" || true)
+            [ -n "$CODE" ] || CODE="000"
+            if [ "$CODE" = "200" ] && grep -q 'user_login_form' "$BODY"; then
+              echo "  Drupal rendered the login form"
+              exit 0
+            fi
+            if [ "$i" -eq 10 ]; then
+              echo "::error::Drupal did not render /user/login (last status $CODE) - the site is broken even though /health is up"
+              echo "First 2000 bytes of the response:"
+              head -c 2000 "$BODY" || true
+              exit 1
+            fi
+            echo "  waiting for Drupal... (status $CODE, attempt $i/10)"
+            sleep 15
+          done
+
+      - name: Surface cloud-init logs
+        if: always() && steps.outputs.outputs.public_ip != ''
+        env:
+          VM_NAME: ${{ vars.PROJECT_NAME }}-dev-vm
+          DEV_RG: ${{ vars.PROJECT_NAME }}-dev-rg
+        run: |
+          {
+            echo "## Cloud-Init Log Scan"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Errors fail the job. Warnings are surfaced for diagnosis only --
+          # openssl and drush both emit benign warnings on every healthy boot,
+          # so failing on them made a correct deploy report red.
+          OUTPUT=$(az vm run-command invoke \
+            --command-id RunShellScript \
+            --name "$VM_NAME" \
+            --resource-group "$DEV_RG" \
+            --scripts "grep -iE '(error|fatal|fail)' /var/log/cloud-init-output.log; echo \"ERROR_EXIT=\$?\"; echo '=== warnings (informational, do not fail the job) ==='; grep -i warning /var/log/cloud-init-output.log" \
+            --query "value[0].message" -o tsv 2>&1)
+
+          echo "$OUTPUT"
+          {
+            echo "$OUTPUT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # grep exits 0 only when it actually matched something
+          if echo "$OUTPUT" | grep -q "ERROR_EXIT=0"; then
+            echo "::error::Errors detected in cloud-init logs (see step summary)"
+            exit 1
+          fi
+
+      - name: Dev Deploy Summary
+        if: always() && steps.outputs.outputs.public_ip != ''
+        run: |
+          {
+            echo "## Dev Environment Deployed"
+            echo ""
+            echo "**Dev Site URL:** https://${{ steps.outputs.outputs.public_ip }}"
+            echo "**Image Version:** ${{ needs.build-image.outputs.image_version }}"
+            echo "**Drupal SHA:** ${{ github.event.client_payload.drupal_sha }}"
+            echo ""
+            echo "After verifying the dev site, open a PR from dev to main to deploy to production."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The OIDC token from the job's first azure/login is valid for 5 minutes,
+      # and az needs it again to reach Key Vault (a new resource). Log in again
+      # so this step does not fail with AADSTS700024. See docs/TODO.md.
+      - name: Azure Login (refresh before Key Vault)
+        if: always() && steps.outputs.outputs.public_ip != ''
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Fetch Postmark token from Key Vault
+        if: always() && steps.outputs.outputs.public_ip != ''
+        env:
+          SECRETS_RG: ${{ vars.PROJECT_NAME }}-secrets-rg
+        run: |
+          KV_NAME=$(az keyvault list -g "$SECRETS_RG" --query "[0].name" -o tsv)
+          TOKEN=$(az keyvault secret show --vault-name "$KV_NAME" \
+            --name shared-postmark-api-token --query value -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "POSTMARK_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Email Notification - Dev VM Ready
+        if: always() && steps.outputs.outputs.public_ip != ''
+        uses: dawidd6/action-send-mail@v18
+        with:
+          server_address: smtp.postmarkapp.com
+          server_port: 587
+          username: ${{ env.POSTMARK_TOKEN }}
+          password: ${{ env.POSTMARK_TOKEN }}
+          subject: "Dev VM Ready - ${{ steps.outputs.outputs.public_ip }}"
+          to: ${{ vars.NOTIFY_EMAIL_TO }}
+          from: ${{ vars.NOTIFY_EMAIL_FROM }}
+          body: |
+            Dev VM deployed successfully.
+
+            Site URL: https://${{ steps.outputs.outputs.public_ip }}
+            Image Version: ${{ needs.build-image.outputs.image_version }}
+            Drupal SHA: ${{ github.event.client_payload.drupal_sha }}
+
+            View workflow run:
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        continue-on-error: true

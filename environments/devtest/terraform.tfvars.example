@@ -1,0 +1,21 @@
+# Copy to terraform.tfvars (gitignored) and fill in real values.
+# This repository is public - never commit the populated file.
+
+project_name    = "volumes"
+storage_prefix  = "vol"
+subscription_id = "REPLACE_WITH_SUBSCRIPTION_ID"
+location        = "eastus2"
+cost_center     = "REPLACE_WITH_COST_CENTER"
+
+tfstate_resource_group_name  = "volumes-tfstate-rg"
+tfstate_storage_account_name = "REPLACE_WITH_STATE_STORAGE_ACCOUNT"
+
+# Local applies authenticate with the Azure CLI, not a GitHub OIDC token.
+use_oidc = false
+
+# Developers who may read devtest data: the shared drupal-media container and
+# the db-dumps container. Read-only, scoped per container.
+# Collect object IDs with: az ad user show --id <netid>@utk.edu --query id -o tsv
+developer_identities = {
+  # netid = "REPLACE_WITH_AAD_OBJECT_ID",
+}

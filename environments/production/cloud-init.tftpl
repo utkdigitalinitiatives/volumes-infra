@@ -1,0 +1,816 @@
+#cloud-config
+# Cloud-init configuration for Drupal VMSS instances
+# This configures database, storage, and runs Drupal site installation
+
+write_files:
+  # Drupal environment configuration (PHP)
+  - path: /etc/drupal/environment.php
+    permissions: '0640'
+    owner: root:drupal
+    content: |
+      <?php
+      /**
+       * Drupal environment configuration.
+       * Populated by cloud-init at boot time.
+       */
+
+      // Database configuration
+      // Password is substituted at boot by /opt/fetch-secrets.sh (Key Vault).
+      $databases['default']['default'] = [
+        'database' => '${db_name}',
+        'username' => '${db_user}',
+        'password' => '__DB_PASSWORD__',
+        'host' => '${db_host}',
+        'port' => '5432',
+        'driver' => 'pgsql',
+        'prefix' => '',
+      ];
+
+      // Hash salt for security
+      // Substituted at boot by /opt/fetch-secrets.sh (Key Vault).
+      $settings['hash_salt'] = '__HASH_SALT__';
+
+      // Trusted host patterns
+      $settings['trusted_host_patterns'] = [
+        '^localhost$',
+        '^127\.0\.0\.1$',
+%{ if lb_fqdn != null ~}
+        '^' . preg_quote('${lb_fqdn}', '/') . '$',
+%{ endif ~}
+%{ if domain_name != null ~}
+        '^' . preg_quote('${domain_name}', '/') . '$',
+%{ endif ~}
+      ];
+
+      // Key module: inject storage key into Key entity.
+      // Substituted at boot by /opt/fetch-secrets.sh (Key Vault).
+      $config['key.key.azure_blob_key']['key_provider'] = 'config';
+      $config['key.key.azure_blob_key']['key_provider_settings']['key_value'] = '__STORAGE_KEY__';
+
+      // Azure Blob File System configuration
+      $config['az_blob_fs.settings']['az_blob_account_name'] = '${storage_account}';
+      $config['az_blob_fs.settings']['az_blob_account_key_name'] = 'azure_blob_key';
+      $config['az_blob_fs.settings']['az_blob_container_name'] = '${storage_container}';
+      $config['az_blob_fs.settings']['az_blob_protocol'] = 'https';
+      $config['az_blob_fs.settings']['az_blob_cdn_host_name'] = '${domain_name}';
+
+      // Outgoing mail (password resets, account mail) through Postmark; the
+      // image has no MTA and Azure blocks port 25. The server token is
+      // substituted at boot by /opt/fetch-secrets.sh. If Key Vault gave none,
+      // the placeholder stays and Drupal keeps its default mailer.
+      // Two paths, one token, and each ignores the other's config:
+      // - with the app's postmark + mailsystem modules (as mccarthy-index has),
+      //   mailsystem routes all mail to the Postmark API, which reads only
+      //   postmark.settings and always sends from the sender signature
+      //   (the system.site mail address);
+      // - without them, core's symfony_mailer over Postmark SMTP, the token
+      //   as both user and password.
+      $postmark_token = '__POSTMARK_TOKEN__';
+      if (!str_starts_with($postmark_token, '__')) {
+        $config['postmark.settings']['postmark_api_key'] = $postmark_token;
+        $config['postmark.settings']['postmark_sender_signature'] = 'librarieswebsite@utk.edu';
+        $config['system.mail']['interface']['default'] = 'symfony_mailer';
+        $config['system.mail']['mailer_dsn'] = [
+          'scheme' => 'smtp',
+          'host' => 'smtp.postmarkapp.com',
+          'user' => $postmark_token,
+          'password' => $postmark_token,
+          'port' => 587,
+          'options' => [],
+        ];
+      }
+      unset($postmark_token);
+
+      // Reverse proxy settings for Azure Load Balancer
+      $settings['reverse_proxy'] = TRUE;
+      $settings['reverse_proxy_addresses'] = ['127.0.0.1', '168.63.129.16'];
+      $settings['reverse_proxy_trusted_headers'] =
+        \Symfony\Component\HttpFoundation\Request::HEADER_X_FORWARDED_FOR |
+        \Symfony\Component\HttpFoundation\Request::HEADER_X_FORWARDED_HOST |
+        \Symfony\Component\HttpFoundation\Request::HEADER_X_FORWARDED_PORT |
+        \Symfony\Component\HttpFoundation\Request::HEADER_X_FORWARDED_PROTO;
+
+  # Secrets bootstrap: fetches Key Vault secrets via VMSS managed identity,
+  # substitutes placeholders in environment.php, and writes /etc/drupal/secrets.env
+  # for downstream shell scripts (drush, etc.).
+  - path: /opt/fetch-secrets.sh
+    permissions: '0750'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      KV_NAME="${kv_name}"
+      ENV_NAME="${env_name}"
+      HASH_SALT_SECRET="${hash_salt_secret_name}"
+      STORAGE_KEY_SECRET="${storage_key_secret_name}"
+      PRIVATE_STORAGE_KEY_SECRET="${private_files_key_secret_name}"
+      ANUBIS_KEY_SECRET="${anubis_key_secret_name}"
+      POSTMARK_TOKEN_SECRET="${postmark_token_secret_name}"
+      ANUBIS_KEY_FILE="/etc/anubis/drupal.key"
+      ENV_PHP="/etc/drupal/environment.php"
+      SECRETS_ENV="/etc/drupal/secrets.env"
+      LOG_FILE="/var/log/drupal-init.log"
+
+      log() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [fetch-secrets] $1" | tee -a "$LOG_FILE"
+      }
+
+      # python3 stderr is silenced: during RBAC propagation the response
+      # lacks the expected key and prints a KeyError traceback that log
+      # scanners flag as an error. Real failures still surface via the
+      # terminal "ERROR: could not fetch required secrets" log below.
+      get_token() {
+        curl -s -H "Metadata: true" \
+          "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net" \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null
+      }
+
+      fetch_secret() {
+        local name="$1"
+        local token="$2"
+        curl -s -H "Authorization: Bearer $token" \
+          "https://$KV_NAME.vault.azure.net/secrets/$name?api-version=7.4" \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])" 2>/dev/null
+      }
+
+      # Retry for ~3 minutes: RBAC role propagation can lag 1-2 minutes after
+      # VMSS boot, especially on first apply when the role assignment itself
+      # is created in parallel with the VMSS instance.
+      DB_PASSWORD=""
+      HASH_SALT=""
+      STORAGE_KEY=""
+      PRIVATE_STORAGE_KEY=""
+      ANUBIS_KEY=""
+      POSTMARK_TOKEN=""
+      for attempt in $(seq 1 18); do
+        TOKEN=$(get_token || true)
+        if [ -n "$TOKEN" ]; then
+          DB_PASSWORD=$(fetch_secret "$ENV_NAME-db-admin-password" "$TOKEN" || true)
+          HASH_SALT=$(fetch_secret "$HASH_SALT_SECRET" "$TOKEN" || true)
+          STORAGE_KEY=$(fetch_secret "$STORAGE_KEY_SECRET" "$TOKEN" || true)
+          # Best-effort: the private-files mount is non-fatal by design, so this
+          # secret is deliberately NOT part of the required set gating the loop.
+          PRIVATE_STORAGE_KEY=$(fetch_secret "$PRIVATE_STORAGE_KEY_SECRET" "$TOKEN" || true)
+          # Best-effort: /opt/anubis-setup.sh serves Drupal without Anubis when
+          # this is missing, so it does not gate the loop either.
+          ANUBIS_KEY=$(fetch_secret "$ANUBIS_KEY_SECRET" "$TOKEN" || true)
+          # Best-effort: without it Drupal keeps its default mailer and the
+          # site still serves; only Drupal's own mail is lost.
+          POSTMARK_TOKEN=$(fetch_secret "$POSTMARK_TOKEN_SECRET" "$TOKEN" || true)
+          [ -n "$DB_PASSWORD" ] && [ -n "$HASH_SALT" ] && [ -n "$STORAGE_KEY" ] && break
+        fi
+        log "Secret fetch attempt $attempt incomplete; retrying in 10s..."
+        sleep 10
+      done
+
+      if [ -z "$DB_PASSWORD" ] || [ -z "$HASH_SALT" ] || [ -z "$STORAGE_KEY" ]; then
+        log "ERROR: could not fetch required secrets from $KV_NAME"
+        exit 1
+      fi
+
+      # Substitute placeholders in environment.php. Use python rather than sed
+      # so '/' '&' '|' in values don't need escaping.
+      DB_PASSWORD="$DB_PASSWORD" HASH_SALT="$HASH_SALT" STORAGE_KEY="$STORAGE_KEY" \
+        POSTMARK_TOKEN="$POSTMARK_TOKEN" python3 - "$ENV_PHP" <<'PYEOF'
+      import os, sys
+      path = sys.argv[1]
+      with open(path) as f:
+          content = f.read()
+      content = content.replace('__DB_PASSWORD__', os.environ['DB_PASSWORD'])
+      content = content.replace('__HASH_SALT__', os.environ['HASH_SALT'])
+      content = content.replace('__STORAGE_KEY__', os.environ['STORAGE_KEY'])
+      if os.environ['POSTMARK_TOKEN']:
+          content = content.replace('__POSTMARK_TOKEN__', os.environ['POSTMARK_TOKEN'])
+      with open(path, 'w') as f:
+          f.write(content)
+      PYEOF
+
+      if [ -n "$POSTMARK_TOKEN" ]; then
+        log "Drupal mail goes through Postmark (Libraries Website server)"
+      else
+        log "WARNING: no Postmark token from Key Vault; Drupal cannot send mail"
+      fi
+
+      umask 077
+      cat > "$SECRETS_ENV" <<EOF
+      DB_PASSWORD=$DB_PASSWORD
+      PRIVATE_STORAGE_KEY=$PRIVATE_STORAGE_KEY
+      EOF
+      chmod 640 "$SECRETS_ENV"
+      chown root:drupal "$SECRETS_ENV"
+
+      # Anubis signing key, root-only: systemd reads it into anubis@drupal's
+      # environment. Kept out of secrets.env, which the drupal group can read.
+      rm -f "$ANUBIS_KEY_FILE"
+      if [ -n "$ANUBIS_KEY" ]; then
+        install -d -m 0755 "$(dirname "$ANUBIS_KEY_FILE")"
+        (umask 077 && printf '%s\n' "$ANUBIS_KEY" > "$ANUBIS_KEY_FILE")
+      fi
+
+      log "Secrets bootstrap complete"
+
+  # Drupal installation script
+  - path: /opt/drupal-init.sh
+    permissions: '0750'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -e
+
+      # Sourced from /opt/fetch-secrets.sh (Key Vault MI).
+      # shellcheck disable=SC1091
+      source /etc/drupal/secrets.env
+
+      DRUPAL_ROOT="/var/www/drupal"
+      DRUSH="$DRUPAL_ROOT/vendor/bin/drush"
+      LOG_FILE="/var/log/drupal-init.log"
+      LOCK_FILE="/var/run/drupal-init.lock"
+
+      # Prevent concurrent runs
+      exec 200>"$LOCK_FILE"
+      flock -n 200 || { echo "Another instance is running"; exit 0; }
+
+      log() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+      }
+
+      log "Starting Drupal initialization..."
+
+      # Fixed site UUID for config sync (set via Terraform)
+      SITE_UUID="${drupal_site_uuid}"
+      CONFIG_SYNC_DIR="$DRUPAL_ROOT/config"
+
+      # az_blob_fs registers a stream wrapper that reads the key.key.azure_blob_key
+      # entity at construction (via the $config overrides in environment.php), so it
+      # cannot be installed by config:import's extension sync: the in-process install
+      # crashes drush ("You have requested a non-existent service") and aborts the
+      # import halfway, leaving every request fatal. Proven 2026-08-13 on the first
+      # dev deploy of the app-side blob wiring; the fix below was rehearsed on the
+      # same VM. Install in separate drush processes, seeding the key entity the
+      # wrapper needs before it first boots. No-op once the DB has the modules.
+      # Output goes to $LOG_FILE without tee: tee would mask exit codes from set -e.
+      enable_blob_modules() {
+        [ -d "$DRUPAL_ROOT/web/modules/contrib/az_blob_fs" ] || return 0
+        if sudo -u drupal $DRUSH pm:list --status=enabled --field=name 2>/dev/null | grep -qx az_blob_fs; then
+          return 0
+        fi
+        log "Pre-installing key + az_blob_fs (config:import cannot install a stream-wrapper module)..."
+        sudo -u drupal $DRUSH en key -y >>"$LOG_FILE" 2>&1
+        if [ -f "$CONFIG_SYNC_DIR/key.key.azure_blob_key.yml" ]; then
+          SEED_DIR=$(mktemp -d)
+          cp "$CONFIG_SYNC_DIR/key.key.azure_blob_key.yml" "$SEED_DIR/"
+          chmod 755 "$SEED_DIR" && chmod 644 "$SEED_DIR/key.key.azure_blob_key.yml"
+          sudo -u drupal $DRUSH config:import --partial --source="$SEED_DIR" -y >>"$LOG_FILE" 2>&1
+          rm -rf "$SEED_DIR"
+        fi
+        sudo -u drupal $DRUSH en az_blob_fs -y >>"$LOG_FILE" 2>&1
+      }
+
+      # Check if Drupal is already installed
+      cd "$DRUPAL_ROOT"
+      if sudo -u drupal $DRUSH status --field=bootstrap 2>/dev/null | grep -q "Successful"; then
+        log "Drupal already installed, running updates..."
+        sudo -u drupal $DRUSH updatedb -y 2>&1 | tee -a "$LOG_FILE" || true
+        sudo -u drupal $DRUSH cache:rebuild 2>&1 | tee -a "$LOG_FILE" || true
+
+        enable_blob_modules
+
+        # Import config if config directory has files
+        if [ -f "$CONFIG_SYNC_DIR/system.site.yml" ]; then
+          log "Config sync directory has config, importing..."
+          # A failed import leaves active config partial and the site broken, so it
+          # must abort loudly. drush exits 0 on "no changes", so the old "may be no
+          # changes" rationale for continuing was false. tee returns 0 regardless of
+          # drush's fate; read the real status from PIPESTATUS.
+          sudo -u drupal $DRUSH config:import -y 2>&1 | tee -a "$LOG_FILE"
+          if [ "$${PIPESTATUS[0]}" -ne 0 ]; then
+            log "ERROR: config:import failed; active config may be partial"
+            exit 1
+          fi
+        else
+          log "No config in sync directory, skipping import"
+        fi
+
+        sudo -u drupal $DRUSH cache:rebuild 2>&1 | tee -a "$LOG_FILE" || true
+        log "Updates complete"
+      else
+        log "Installing Drupal..."
+        sudo -u drupal $DRUSH site:install "${install_profile}" \
+          --db-url="pgsql://${db_user}:$DB_PASSWORD@${db_host}:5432/${db_name}" \
+          --site-name="${site_name}" \
+          --site-mail="${site_mail}" \
+          --account-name="${admin_username}" \
+          --account-pass="${drupal_admin_password}" \
+          --account-mail="${admin_mail}" \
+          -y 2>&1 | tee -a "$LOG_FILE"
+
+        # Set fixed site UUID for config sync compatibility
+        log "Setting site UUID to $SITE_UUID..."
+        sudo -u drupal $DRUSH config:set system.site uuid "$SITE_UUID" -y 2>&1 | tee -a "$LOG_FILE"
+
+        log "Enabling Azure Blob FS module..."
+        enable_blob_modules
+
+        log "Rebuilding cache..."
+        sudo -u drupal $DRUSH cache:rebuild 2>&1 | tee -a "$LOG_FILE"
+
+        log "Drupal installation complete"
+      fi
+
+      log "Drupal initialization finished"
+
+  # Mount the Azure Files share backing Drupal's private:// filesystem over
+  # /var/www/drupal/private (the path the base image bakes into settings.php as
+  # file_private_path). This replaces the ephemeral per-instance local directory
+  # with durable, shared storage so editor-only webform/media uploads survive
+  # VMSS reimages and stay consistent across rolling-deploy surge instances.
+  # Non-fatal by design: on any failure the site still boots and private://
+  # falls back to the empty local directory, loudly logged for monitoring.
+  - path: /opt/mount-private-files.sh
+    permissions: '0750'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+
+      STORAGE_ACCOUNT="${private_files_account}"
+      SHARE_NAME="${private_files_share}"
+      MOUNT_POINT="/var/www/drupal/private"
+      CRED_DIR="/etc/smbcredentials"
+      CRED_FILE="$CRED_DIR/$STORAGE_ACCOUNT.cred"
+      LOG_FILE="/var/log/drupal-init.log"
+
+      log() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [mount-private] $1" | tee -a "$LOG_FILE"
+      }
+
+      # PRIVATE_STORAGE_KEY (dedicated private-files account, not the media
+      # account) was persisted to secrets.env by /opt/fetch-secrets.sh via the
+      # Key Vault managed identity.
+      # shellcheck disable=SC1091
+      source /etc/drupal/secrets.env
+      if [ -z "$${PRIVATE_STORAGE_KEY:-}" ]; then
+        log "ERROR: PRIVATE_STORAGE_KEY unavailable; skipping mount. private:// falls back to ephemeral local dir."
+        exit 0
+      fi
+
+      # cifs-utils is baked into the shared base image from 2026.08.1 onward;
+      # install on demand for older ones.
+      if ! rpm -q cifs-utils >/dev/null 2>&1; then
+        log "Installing cifs-utils..."
+        dnf install -y cifs-utils 2>&1 | tail -1 | tee -a "$LOG_FILE" || {
+          log "ERROR: cifs-utils install failed; skipping private files mount."
+          exit 0
+        }
+      fi
+
+      # Idempotent: already mounted (e.g. a re-run) means nothing to do.
+      if mountpoint -q "$MOUNT_POINT"; then
+        log "$MOUNT_POINT already mounted; nothing to do."
+        exit 0
+      fi
+
+      install -d -m 0770 -o drupal -g drupal "$MOUNT_POINT"
+
+      umask 077
+      mkdir -p "$CRED_DIR"
+      cat > "$CRED_FILE" <<CREDEOF
+      username=$STORAGE_ACCOUNT
+      password=$PRIVATE_STORAGE_KEY
+      CREDEOF
+      chmod 600 "$CRED_FILE"
+
+      DRUPAL_UID=$(id -u drupal)
+      DRUPAL_GID=$(id -g drupal)
+
+      # Persist in fstab so the mount also survives an in-place reboot (host
+      # maintenance), not just reimages where cloud-init re-runs. _netdev + nofail
+      # keep boot from hanging/failing if the share is briefly unreachable.
+      # SELinux is enforcing and CIFS takes a single mount-wide label, so force the
+      # same context Apache/php-fpm use for the web root (httpd_sys_rw_content_t) --
+      # otherwise php-fpm cannot read/write the mounted private files.
+      MOUNT_OPTS="credentials=$CRED_FILE,vers=3.1.1,uid=$DRUPAL_UID,gid=$DRUPAL_GID,dir_mode=0770,file_mode=0660,serverino,nosharesock,actimeo=30,mfsymlinks,_netdev,nofail,context=system_u:object_r:httpd_sys_rw_content_t:s0"
+      FSTAB_LINE="//$STORAGE_ACCOUNT.file.core.windows.net/$SHARE_NAME $MOUNT_POINT cifs $MOUNT_OPTS 0 0"
+      if ! grep -qF " $MOUNT_POINT cifs " /etc/fstab 2>/dev/null; then
+        echo "$FSTAB_LINE" >> /etc/fstab
+      fi
+
+      if mount "$MOUNT_POINT" 2>&1 | tee -a "$LOG_FILE"; then
+        log "Mounted //$STORAGE_ACCOUNT.file.core.windows.net/$SHARE_NAME at $MOUNT_POINT"
+      else
+        log "ERROR: failed to mount private files share; continuing with ephemeral local dir."
+        exit 0
+      fi
+
+  # Loopback-only Drupal vhost that Anubis forwards to. Inert until
+  # /opt/anubis-setup.sh creates the marker, so an image without Anubis (or a
+  # failed Anubis start) leaves Apache exactly as it was. Port 8008 because
+  # SELinux already labels it http_port_t; an unlabeled port stops httpd.
+  - path: /etc/httpd/conf.d/drupal-backend.conf
+    permissions: '0644'
+    owner: root:root
+    content: |
+      <IfFile /etc/anubis/drupal.active>
+      Listen 127.0.0.1:8008
+      <VirtualHost 127.0.0.1:8008>
+          DocumentRoot /var/www/drupal/web
+
+          <Directory /var/www/drupal/web>
+              Options -Indexes +FollowSymLinks
+              AllowOverride All
+              Require all granted
+              RewriteEngine On
+              RewriteBase /
+              RewriteCond %%{REQUEST_FILENAME} !-f
+              RewriteCond %%{REQUEST_FILENAME} !-d
+              RewriteRule ^ index.php [L]
+          </Directory>
+
+          <FilesMatch \.php$>
+              SetHandler "proxy:unix:/run/php-fpm/drupal.sock|fcgi://localhost"
+          </FilesMatch>
+
+          # Every request here comes from Anubis, so log the client it saw.
+          LogFormat "%%{X-Real-Ip}i %l %u %t \"%r\" %>s %b \"%%{Referer}i\" \"%%{User-Agent}i\"" anubis_backend
+          ErrorLog /var/log/httpd/drupal-backend-error.log
+          CustomLog /var/log/httpd/drupal-backend-access.log anubis_backend
+      </VirtualHost>
+      </IfFile>
+
+  # Anubis bot protection. Never fails the boot: on any problem it removes the
+  # marker, and Apache serves Drupal directly as it did before Anubis existed.
+  # The binary and policy come from the app image; the signing key from Key
+  # Vault via /opt/fetch-secrets.sh, shared so a pass on one instance is
+  # honoured by the others.
+  - path: /opt/anubis-setup.sh
+    permissions: '0750'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+
+      KEY_FILE="/etc/anubis/drupal.key"
+      ENV_FILE="/etc/anubis/drupal.env"
+      MARKER="/etc/anubis/drupal.active"
+      LOG_FILE="/var/log/drupal-init.log"
+
+      log() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [anubis-setup] $1" | tee -a "$LOG_FILE"
+      }
+
+      fall_back() {
+        log "ERROR: $1; Apache serves Drupal directly, without bot protection"
+        rm -f "$MARKER"
+        systemctl disable --now anubis@drupal >/dev/null 2>&1 || true
+        systemctl restart httpd || true
+        exit 0
+      }
+
+      rm -f "$MARKER"
+
+      if ! command -v anubis >/dev/null 2>&1; then
+        log "Anubis is not in this image; Apache serves Drupal directly"
+        exit 0
+      fi
+      [ -s "$KEY_FILE" ] || fall_back "no Anubis signing key from Key Vault"
+
+      umask 077
+      cat > "$ENV_FILE" <<ENVEOF
+      BIND=127.0.0.1:8923
+      BIND_NETWORK=tcp
+      TARGET=http://127.0.0.1:8008
+      METRICS_BIND=127.0.0.1:8924
+      METRICS_BIND_NETWORK=tcp
+      POLICY_FNAME=/etc/anubis/drupal.botPolicies.yaml
+      DIFFICULTY=4
+      SERVE_ROBOTS_TXT=false
+      REDIRECT_DOMAINS=${join(",", compact([domain_name, lb_fqdn]))}
+      ED25519_PRIVATE_KEY_HEX=$(cat "$KEY_FILE")
+      ENVEOF
+
+      systemctl enable anubis@drupal >/dev/null 2>&1
+      systemctl restart anubis@drupal
+      for _ in $(seq 1 15); do
+        curl -sf -o /dev/null http://127.0.0.1:8924/metrics && break
+        sleep 2
+      done
+      curl -sf -o /dev/null http://127.0.0.1:8924/metrics || fall_back "anubis@drupal did not start"
+
+      touch "$MARKER"
+      if ! apachectl configtest >>"$LOG_FILE" 2>&1; then
+        fall_back "Apache config test rejected the Anubis vhosts"
+      fi
+      systemctl restart httpd || fall_back "httpd would not restart with the Anubis vhosts"
+
+      # End to end: Anubis -> backend vhost -> the static health file. curl
+      # does not claim to be a browser, so the policy lets it through.
+      CODE=$(curl -s -o /dev/null -w '%%{http_code}' -H 'X-Real-Ip: 127.0.0.1' http://127.0.0.1:8923/health)
+      [ "$CODE" = "200" ] || fall_back "request through Anubis to the backend vhost returned $CODE"
+
+      log "Anubis is in front of Drupal (127.0.0.1:8923 -> 127.0.0.1:8008)"
+
+%{ if enable_https && domain_name != null ~}
+  # TLS setup script (Let's Encrypt with blob-backed cert persistence)
+  - path: /opt/tls-setup.sh
+    permissions: '0750'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -e
+
+      DOMAIN="${domain_name}"
+      STORAGE_ACCOUNT="${storage_account}"
+      CERT_CONTAINER="tls-certs"
+      CERT_DIR="/etc/pki/tls"
+      CERT_FILE="$CERT_DIR/certs/letsencrypt-fullchain.pem"
+      KEY_FILE="$CERT_DIR/private/letsencrypt-privkey.pem"
+      LOG_FILE="/var/log/drupal-init.log"
+
+      log() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [tls-setup] $1" | tee -a "$LOG_FILE"
+      }
+
+      log "Starting TLS setup for $DOMAIN..."
+
+      # Get Azure managed identity token via IMDS
+      get_token() {
+        curl -s -H "Metadata: true" \
+          "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])"
+      }
+
+      # Download blob from Azure Storage
+      download_blob() {
+        local blob_path="$1"
+        local dest="$2"
+        local token
+        token=$(get_token)
+        local http_code
+        http_code=$(curl -s -o "$dest" -w "%%{http_code}" \
+          -H "Authorization: Bearer $token" \
+          -H "x-ms-version: 2020-10-02" \
+          "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CERT_CONTAINER/$blob_path")
+        [ "$http_code" = "200" ]
+      }
+
+      # Upload blob to Azure Storage
+      upload_blob() {
+        local src="$1"
+        local blob_path="$2"
+        local token
+        token=$(get_token)
+        curl -s -X PUT \
+          -H "Authorization: Bearer $token" \
+          -H "x-ms-version: 2020-10-02" \
+          -H "x-ms-blob-type: BlockBlob" \
+          -H "Content-Type: application/x-pem-file" \
+          --data-binary "@$src" \
+          "https://$STORAGE_ACCOUNT.blob.core.windows.net/$CERT_CONTAINER/$blob_path"
+      }
+
+      CERT_VALID=false
+
+      # Try to download existing cert from blob storage
+      log "Checking for existing certificate in blob storage..."
+      if download_blob "$DOMAIN/fullchain.pem" "$CERT_FILE" && \
+         download_blob "$DOMAIN/privkey.pem" "$KEY_FILE"; then
+        chmod 644 "$CERT_FILE"
+        chmod 600 "$KEY_FILE"
+        # Validate cert is not expired/expiring within 7 days
+        if openssl x509 -checkend 604800 -noout -in "$CERT_FILE" 2>/dev/null; then
+          log "Valid certificate found in blob storage"
+          CERT_VALID=true
+        else
+          log "Certificate from blob storage is expired or expiring soon"
+        fi
+      else
+        log "No certificate found in blob storage"
+      fi
+
+      # Issue new cert with certbot if needed
+      if [ "$CERT_VALID" = false ]; then
+        log "Installing certbot..."
+        dnf install -y certbot 2>&1 | tail -1 | tee -a "$LOG_FILE"
+
+        log "Requesting certificate from Let's Encrypt..."
+        certbot certonly --webroot \
+          -w /var/www/drupal/web \
+          -d "$DOMAIN" \
+          --register-unsafely-without-email \
+          --agree-tos \
+          --non-interactive 2>&1 | tee -a "$LOG_FILE"
+
+        # Copy certbot certs to standard location
+        cp "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERT_FILE"
+        cp "/etc/letsencrypt/live/$DOMAIN/privkey.pem" "$KEY_FILE"
+        chmod 644 "$CERT_FILE"
+        chmod 600 "$KEY_FILE"
+
+        # Upload to blob storage for other instances
+        log "Uploading certificate to blob storage..."
+        upload_blob "$CERT_FILE" "$DOMAIN/fullchain.pem"
+        upload_blob "$KEY_FILE" "$DOMAIN/privkey.pem"
+        log "Certificate uploaded to blob storage"
+
+        CERT_VALID=true
+      fi
+
+      if [ "$CERT_VALID" = true ]; then
+        # Write Apache HTTPS vhost
+        cat > /etc/httpd/conf.d/ssl-letsencrypt.conf <<SSLEOF
+      Listen 443 https
+      <VirtualHost *:443>
+          SSLEngine on
+          SSLCertificateFile $CERT_FILE
+          SSLCertificateKeyFile $KEY_FILE
+
+          SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+          SSLCipherSuite ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+          SSLHonorCipherOrder off
+
+          DocumentRoot /var/www/drupal/web
+
+          # Without Anubis: serve Drupal from this vhost.
+          <IfFile !/etc/anubis/drupal.active>
+              <Directory /var/www/drupal/web>
+                  Options -Indexes +FollowSymLinks
+                  AllowOverride All
+                  Require all granted
+                  RewriteEngine On
+                  RewriteBase /
+                  RewriteCond %%{REQUEST_FILENAME} !-f
+                  RewriteCond %%{REQUEST_FILENAME} !-d
+                  RewriteRule ^ index.php [L]
+              </Directory>
+
+              <FilesMatch \.php$>
+                  SetHandler "proxy:unix:/run/php-fpm/drupal.sock|fcgi://localhost"
+              </FilesMatch>
+          </IfFile>
+
+          # With Anubis (/opt/anubis-setup.sh made the marker): everything but
+          # /health and /drupal-media/ goes through Anubis on 127.0.0.1:8923,
+          # which forwards what passes to drupal-backend.conf on 127.0.0.1:8008.
+          # Drupal trusts 127.0.0.1 as a proxy, so it takes the client IP,
+          # scheme, host and port from these headers. Client-sent copies are
+          # dropped first; mod_proxy then adds X-Forwarded-For/-Host itself.
+          <IfFile /etc/anubis/drupal.active>
+              RequestHeader unset X-Forwarded-For
+              RequestHeader unset X-Forwarded-Host
+              RequestHeader set X-Forwarded-Proto "https"
+              RequestHeader set X-Forwarded-Port "443"
+              RequestHeader set X-Real-Ip expr=%%{REMOTE_ADDR}
+              RequestHeader set X-Http-Version "%%{SERVER_PROTOCOL}s"
+
+              ProxyPass /health !
+              ProxyPass /drupal-media/ !
+
+              # UT Power T instead of the Anubis mascot on the challenge pages.
+              # The files come from the app image (packer/ansible/playbook.yml).
+              ProxyPass /.within.website/x/cmd/anubis/static/img/ !
+              Alias /.within.website/x/cmd/anubis/static/img/ /var/www/anubis/img/
+              <Directory /var/www/anubis/img>
+                  Require all granted
+              </Directory>
+
+              ProxyPass / http://127.0.0.1:8923/
+              ProxyPassReverse / http://127.0.0.1:8923/
+
+              # Anubis and Drupal need the real Host; the blob proxy below
+              # must NOT send it, or Azure Storage rejects the request.
+              <Location />
+                  ProxyPreserveHost On
+              </Location>
+              <Location /drupal-media/>
+                  ProxyPreserveHost Off
+              </Location>
+          </IfFile>
+
+          <Location /health>
+              SetHandler none
+              Require all granted
+          </Location>
+
+          # Reverse proxy for Azure Blob Storage files (private container, SAS auth)
+          SSLProxyEngine On
+          RewriteEngine On
+          RewriteCond %%{REQUEST_URI} ^/drupal-media/
+          RewriteRule ^/drupal-media/(.*)$ https://${storage_account}.blob.core.windows.net/drupal-media/\$1${storage_sas_token} [P,L,NE,E=proxy-nocanon:1]
+
+          Header always set X-Frame-Options "SAMEORIGIN"
+          Header always set X-Content-Type-Options "nosniff"
+          Header always set X-XSS-Protection "1; mode=block"
+          Header always set Strict-Transport-Security "max-age=300"
+
+          ErrorLog /var/log/httpd/drupal-ssl-error.log
+          CustomLog /var/log/httpd/drupal-ssl-access.log combined
+          ProxyTimeout 300
+      </VirtualHost>
+      SSLEOF
+
+        # Replace HTTP vhost with redirect (exempt /health and ACME challenge)
+        cat > /etc/httpd/conf.d/drupal.conf <<HTTPEOF
+      <VirtualHost *:80>
+          RewriteEngine On
+          RewriteCond %%{REQUEST_URI} !^/health
+          RewriteCond %%{REQUEST_URI} !^/\.well-known/acme-challenge/
+          RewriteRule ^(.*)$ https://%%{HTTP_HOST}\$1 [R=301,L]
+
+          <Location /health>
+              SetHandler none
+              Require all granted
+          </Location>
+
+          # Allow ACME challenges for cert renewal
+          DocumentRoot /var/www/drupal/web
+          <Directory /var/www/drupal/web/.well-known>
+              Require all granted
+          </Directory>
+      </VirtualHost>
+      HTTPEOF
+
+        log "Apache HTTPS configuration written"
+
+        # Set up cert renewal
+        if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+          # Certbot issued the cert — use certbot renewal
+          cat > /etc/letsencrypt/renewal-hooks/deploy/01-update-and-upload.sh <<'RENEWEOF'
+      #!/bin/bash
+      DOMAIN="$RENEWED_DOMAINS"
+      cp "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" /etc/pki/tls/certs/letsencrypt-fullchain.pem
+      cp "/etc/letsencrypt/live/$DOMAIN/privkey.pem" /etc/pki/tls/private/letsencrypt-privkey.pem
+      chmod 644 /etc/pki/tls/certs/letsencrypt-fullchain.pem
+      chmod 600 /etc/pki/tls/private/letsencrypt-privkey.pem
+      systemctl restart httpd
+      # Re-upload to blob storage
+      /opt/tls-upload-cert.sh
+      RENEWEOF
+          chmod 750 /etc/letsencrypt/renewal-hooks/deploy/01-update-and-upload.sh
+
+          # Upload helper script
+          cat > /opt/tls-upload-cert.sh <<UPLOADEOF
+      #!/bin/bash
+      TOKEN=\$(curl -s -H "Metadata: true" \
+        "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+      for FILE in fullchain.pem privkey.pem; do
+        SRC="/etc/pki/tls/\$([ \$FILE = fullchain.pem ] && echo certs || echo private)/letsencrypt-\$FILE"
+        curl -s -X PUT \
+          -H "Authorization: Bearer \$TOKEN" \
+          -H "x-ms-version: 2020-10-02" \
+          -H "x-ms-blob-type: BlockBlob" \
+          -H "Content-Type: application/x-pem-file" \
+          --data-binary "@\$SRC" \
+          "https://${storage_account}.blob.core.windows.net/tls-certs/${domain_name}/\$FILE"
+      done
+      UPLOADEOF
+          chmod 750 /opt/tls-upload-cert.sh
+
+          systemctl enable certbot-renew.timer
+          systemctl start certbot-renew.timer
+          log "Certbot renewal timer enabled"
+        else
+          # Cert came from blob — set up daily cron to check expiry and re-fetch
+          cat > /etc/cron.daily/tls-check <<CRONEOF
+      #!/bin/bash
+      if ! openssl x509 -checkend 604800 -noout -in /etc/pki/tls/certs/letsencrypt-fullchain.pem 2>/dev/null; then
+        /opt/tls-setup.sh
+      fi
+      CRONEOF
+          chmod 750 /etc/cron.daily/tls-check
+          log "Daily cert expiry check cron installed"
+        fi
+      fi
+
+      log "TLS setup complete"
+%{ endif ~}
+
+runcmd:
+  # Ensure directories have correct ownership
+  - chown root:drupal /etc/drupal
+  - chmod 750 /etc/drupal
+  - chown root:drupal /etc/drupal/environment.php
+
+  # Fetch secrets from Key Vault (must run before drupal-init.sh)
+  - /opt/fetch-secrets.sh
+
+  # Mount Azure Files share for durable private:// storage
+  # (needs PRIVATE_STORAGE_KEY from fetch-secrets.sh above)
+  - /opt/mount-private-files.sh
+
+  # Run Drupal initialization
+  - /opt/drupal-init.sh
+
+%{ if enable_https && domain_name != null ~}
+  # Configure TLS (Let's Encrypt)
+  - /opt/tls-setup.sh
+%{ endif ~}
+
+  # Put Anubis in front of Drupal (needs the key from fetch-secrets.sh and,
+  # for the 443 vhost it switches, tls-setup.sh above)
+  - /opt/anubis-setup.sh
+
+  # Restart web services
+  - systemctl restart php-fpm
+  - systemctl restart httpd

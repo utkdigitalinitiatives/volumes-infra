@@ -1,0 +1,441 @@
+#cloud-config
+# Cloud-init configuration for Drupal dev VMs
+# This configures database, storage, and initializes Drupal from synced DB
+
+write_files:
+  # Drupal environment configuration (PHP)
+  - path: /etc/drupal/environment.php
+    permissions: '0640'
+    owner: root:drupal
+    content: |
+      <?php
+      /**
+       * Drupal environment configuration.
+       * Populated by cloud-init at boot time.
+       */
+
+      // Database configuration
+      // Password is substituted at boot by /opt/fetch-secrets.sh (Key Vault).
+      $databases['default']['default'] = [
+        'database' => '${db_name}',
+        'username' => '${db_user}',
+        'password' => '__DB_PASSWORD__',
+        'host' => '${db_host}',
+        'port' => '5432',
+        'driver' => 'pgsql',
+        'prefix' => '',
+      ];
+
+      // Hash salt for security
+      // Substituted at boot by /opt/fetch-secrets.sh (Key Vault).
+      $settings['hash_salt'] = '__HASH_SALT__';
+
+      // Trusted host patterns (allow IP access for dev/test)
+      $settings['trusted_host_patterns'] = [
+        '^localhost$',
+        '^127\.0\.0\.1$',
+        '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$',
+      ];
+
+      // Key module: inject storage key into Key entity.
+      // Substituted at boot by /opt/fetch-secrets.sh (Key Vault).
+      $config['key.key.azure_blob_key']['key_provider'] = 'config';
+      $config['key.key.azure_blob_key']['key_provider_settings']['key_value'] = '__STORAGE_KEY__';
+
+      // Azure Blob File System configuration
+      $config['az_blob_fs.settings']['az_blob_account_name'] = '${storage_account}';
+      $config['az_blob_fs.settings']['az_blob_account_key_name'] = 'azure_blob_key';
+      $config['az_blob_fs.settings']['az_blob_container_name'] = 'drupal-media';
+      $config['az_blob_fs.settings']['az_blob_protocol'] = 'https';
+      $az_blob_host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'localhost';
+      $config['az_blob_fs.settings']['az_blob_cdn_host_name'] = $az_blob_host;
+
+  # Secrets bootstrap: fetches Key Vault secrets via VM managed identity
+  # and substitutes placeholders in environment.php.
+  - path: /opt/fetch-secrets.sh
+    permissions: '0750'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      KV_NAME="${kv_name}"
+      ENV_NAME="${env_name}"
+      HASH_SALT_SECRET="${hash_salt_secret_name}"
+      STORAGE_KEY_SECRET="${storage_key_secret_name}"
+      ANUBIS_KEY_SECRET="${anubis_key_secret_name}"
+      ANUBIS_KEY_FILE="/etc/anubis/drupal.key"
+      ENV_PHP="/etc/drupal/environment.php"
+      LOG_FILE="/var/log/cloud-init-output.log"
+
+      log() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [fetch-secrets] $1" | tee -a "$LOG_FILE"
+      }
+
+      # python3 stderr is silenced: during RBAC propagation the response
+      # lacks the expected key and prints a KeyError traceback that the
+      # workflow's log scanner flags. Real failures still surface via the
+      # terminal "ERROR: could not fetch required secrets" log below.
+      get_token() {
+        curl -s -H "Metadata: true" \
+          "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net" \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null
+      }
+
+      fetch_secret() {
+        local name="$1"
+        local token="$2"
+        curl -s -H "Authorization: Bearer $token" \
+          "https://$KV_NAME.vault.azure.net/secrets/$name?api-version=7.4" \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])" 2>/dev/null
+      }
+
+      # Retry for ~3 minutes: the dev VM is recreated each merge, so the KV
+      # role assignment is fresh on every boot and RBAC propagation can lag
+      # 1-2 minutes behind cloud-init's first fetch.
+      DB_PASSWORD=""
+      HASH_SALT=""
+      STORAGE_KEY=""
+      ANUBIS_KEY=""
+      for attempt in $(seq 1 18); do
+        TOKEN=$(get_token || true)
+        if [ -n "$TOKEN" ]; then
+          DB_PASSWORD=$(fetch_secret "$ENV_NAME-db-admin-password" "$TOKEN" || true)
+          HASH_SALT=$(fetch_secret "$HASH_SALT_SECRET" "$TOKEN" || true)
+          STORAGE_KEY=$(fetch_secret "$STORAGE_KEY_SECRET" "$TOKEN" || true)
+          # Best-effort: /opt/anubis-setup.sh serves Drupal without Anubis when
+          # this is missing, so it does not gate the loop either.
+          ANUBIS_KEY=$(fetch_secret "$ANUBIS_KEY_SECRET" "$TOKEN" || true)
+          [ -n "$DB_PASSWORD" ] && [ -n "$HASH_SALT" ] && [ -n "$STORAGE_KEY" ] && break
+        fi
+        log "Secret fetch attempt $attempt incomplete; retrying in 10s..."
+        sleep 10
+      done
+
+      if [ -z "$DB_PASSWORD" ] || [ -z "$HASH_SALT" ] || [ -z "$STORAGE_KEY" ]; then
+        log "ERROR: could not fetch required secrets from $KV_NAME"
+        exit 1
+      fi
+
+      DB_PASSWORD="$DB_PASSWORD" HASH_SALT="$HASH_SALT" STORAGE_KEY="$STORAGE_KEY" \
+        python3 - "$ENV_PHP" <<'PYEOF'
+      import os, sys
+      path = sys.argv[1]
+      with open(path) as f:
+          content = f.read()
+      content = content.replace('__DB_PASSWORD__', os.environ['DB_PASSWORD'])
+      content = content.replace('__HASH_SALT__', os.environ['HASH_SALT'])
+      content = content.replace('__STORAGE_KEY__', os.environ['STORAGE_KEY'])
+      with open(path, 'w') as f:
+          f.write(content)
+      PYEOF
+
+      # Anubis signing key, root-only: systemd reads it into anubis@drupal's
+      # environment.
+      rm -f "$ANUBIS_KEY_FILE"
+      if [ -n "$ANUBIS_KEY" ]; then
+        install -d -m 0755 "$(dirname "$ANUBIS_KEY_FILE")"
+        (umask 077 && printf '%s\n' "$ANUBIS_KEY" > "$ANUBIS_KEY_FILE")
+      fi
+
+      log "Secrets bootstrap complete"
+
+  # Loopback-only Drupal vhost that Anubis forwards to. Inert until
+  # /opt/anubis-setup.sh creates the marker, so an image without Anubis (or a
+  # failed Anubis start) leaves Apache exactly as it was. Port 8008 because
+  # SELinux already labels it http_port_t; an unlabeled port stops httpd.
+  - path: /etc/httpd/conf.d/drupal-backend.conf
+    permissions: '0644'
+    owner: root:root
+    content: |
+      <IfFile /etc/anubis/drupal.active>
+      Listen 127.0.0.1:8008
+      <VirtualHost 127.0.0.1:8008>
+          DocumentRoot /var/www/drupal/web
+
+          <Directory /var/www/drupal/web>
+              Options -Indexes +FollowSymLinks
+              AllowOverride All
+              Require all granted
+              RewriteEngine On
+              RewriteBase /
+              RewriteCond %%{REQUEST_FILENAME} !-f
+              RewriteCond %%{REQUEST_FILENAME} !-d
+              RewriteRule ^ index.php [L]
+          </Directory>
+
+          <FilesMatch \.php$>
+              SetHandler "proxy:unix:/run/php-fpm/drupal.sock|fcgi://localhost"
+          </FilesMatch>
+
+          # Every request here comes from Anubis, so log the client it saw.
+          LogFormat "%%{X-Real-Ip}i %l %u %t \"%r\" %>s %b \"%%{Referer}i\" \"%%{User-Agent}i\"" anubis_backend
+          ErrorLog /var/log/httpd/drupal-backend-error.log
+          CustomLog /var/log/httpd/drupal-backend-access.log anubis_backend
+      </VirtualHost>
+      </IfFile>
+
+  # Anubis bot protection. Never fails the boot: on any problem it removes the
+  # marker, and Apache serves Drupal directly as it did before Anubis existed.
+  # Its ERROR lines are meant to trip the workflow's log scan: a dev VM that
+  # fell back means the image or the key is broken, and production would
+  # fall back the same way.
+  - path: /opt/anubis-setup.sh
+    permissions: '0750'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+
+      KEY_FILE="/etc/anubis/drupal.key"
+      ENV_FILE="/etc/anubis/drupal.env"
+      MARKER="/etc/anubis/drupal.active"
+      LOG_FILE="/var/log/cloud-init-output.log"
+
+      log() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [anubis-setup] $1" | tee -a "$LOG_FILE"
+      }
+
+      fall_back() {
+        log "ERROR: $1; Apache serves Drupal directly, without bot protection"
+        rm -f "$MARKER"
+        systemctl disable --now anubis@drupal >/dev/null 2>&1 || true
+        systemctl restart httpd || true
+        exit 0
+      }
+
+      rm -f "$MARKER"
+
+      if ! command -v anubis >/dev/null 2>&1; then
+        log "Anubis is not in this image; Apache serves Drupal directly"
+        exit 0
+      fi
+      [ -s "$KEY_FILE" ] || fall_back "no Anubis signing key from Key Vault"
+
+      # No REDIRECT_DOMAINS: the dev VM is reached by IP, which is not known
+      # here. Production sets it.
+      umask 077
+      cat > "$ENV_FILE" <<ENVEOF
+      BIND=127.0.0.1:8923
+      BIND_NETWORK=tcp
+      TARGET=http://127.0.0.1:8008
+      METRICS_BIND=127.0.0.1:8924
+      METRICS_BIND_NETWORK=tcp
+      POLICY_FNAME=/etc/anubis/drupal.botPolicies.yaml
+      DIFFICULTY=4
+      SERVE_ROBOTS_TXT=false
+      ED25519_PRIVATE_KEY_HEX=$(cat "$KEY_FILE")
+      ENVEOF
+
+      systemctl enable anubis@drupal >/dev/null 2>&1
+      systemctl restart anubis@drupal
+      for _ in $(seq 1 15); do
+        curl -sf -o /dev/null http://127.0.0.1:8924/metrics && break
+        sleep 2
+      done
+      curl -sf -o /dev/null http://127.0.0.1:8924/metrics || fall_back "anubis@drupal did not start"
+
+      touch "$MARKER"
+      if ! apachectl configtest >>"$LOG_FILE" 2>&1; then
+        fall_back "Apache config test rejected the Anubis vhosts"
+      fi
+      systemctl restart httpd || fall_back "httpd would not restart with the Anubis vhosts"
+
+      # End to end: Anubis -> backend vhost -> the static health file. curl
+      # does not claim to be a browser, so the policy lets it through.
+      CODE=$(curl -s -o /dev/null -w '%%{http_code}' -H 'X-Real-Ip: 127.0.0.1' http://127.0.0.1:8923/health)
+      [ "$CODE" = "200" ] || fall_back "request through Anubis to the backend vhost returned $CODE"
+
+      log "Anubis is in front of Drupal (127.0.0.1:8923 -> 127.0.0.1:8008)"
+
+runcmd:
+  # Ensure directories have correct ownership
+  - chown root:drupal /etc/drupal
+  - chmod 750 /etc/drupal
+  - chown root:drupal /etc/drupal/environment.php
+
+  # Fetch secrets from Key Vault before any drush command runs
+  - /opt/fetch-secrets.sh
+
+  # Generate self-signed TLS certificate
+  - |
+    openssl req -x509 -nodes -days 30 \
+      -newkey rsa:2048 \
+      -keyout /etc/pki/tls/private/drupal-selfsigned.key \
+      -out /etc/pki/tls/certs/drupal-selfsigned.crt \
+      -subj "/CN=dev-vm/O=/OU=dev"
+    chmod 600 /etc/pki/tls/private/drupal-selfsigned.key
+
+  # Configure Apache HTTPS vhost
+  - |
+    cat > /etc/httpd/conf.d/ssl-selfsigned.conf <<'SSLCONF'
+    Listen 443 https
+    <VirtualHost *:443>
+        SSLEngine on
+        SSLCertificateFile /etc/pki/tls/certs/drupal-selfsigned.crt
+        SSLCertificateKeyFile /etc/pki/tls/private/drupal-selfsigned.key
+
+        DocumentRoot /var/www/drupal/web
+
+        # Without Anubis: serve Drupal from this vhost.
+        <IfFile !/etc/anubis/drupal.active>
+            <Directory /var/www/drupal/web>
+                Options -Indexes +FollowSymLinks
+                AllowOverride All
+                Require all granted
+                RewriteEngine On
+                RewriteBase /
+                RewriteCond %%{REQUEST_FILENAME} !-f
+                RewriteCond %%{REQUEST_FILENAME} !-d
+                RewriteRule ^ index.php [L]
+            </Directory>
+
+            <FilesMatch \.php$>
+                SetHandler "proxy:unix:/run/php-fpm/drupal.sock|fcgi://localhost"
+            </FilesMatch>
+        </IfFile>
+
+        # With Anubis (/opt/anubis-setup.sh made the marker): everything but
+        # /health and /drupal-media/ goes through Anubis on 127.0.0.1:8923,
+        # which forwards what passes to drupal-backend.conf on 127.0.0.1:8008.
+        # Drupal trusts 127.0.0.1 as a proxy, so it takes the client IP,
+        # scheme, host and port from these headers. Client-sent copies are
+        # dropped first; mod_proxy then adds X-Forwarded-For/-Host itself.
+        <IfFile /etc/anubis/drupal.active>
+            RequestHeader unset X-Forwarded-For
+            RequestHeader unset X-Forwarded-Host
+            RequestHeader set X-Forwarded-Proto "https"
+            RequestHeader set X-Forwarded-Port "443"
+            RequestHeader set X-Real-Ip expr=%%{REMOTE_ADDR}
+            RequestHeader set X-Http-Version "%%{SERVER_PROTOCOL}s"
+
+            ProxyPass /health !
+            ProxyPass /drupal-media/ !
+
+            # UT Power T instead of the Anubis mascot on the challenge pages.
+            # The files come from the app image (packer/ansible/playbook.yml).
+            ProxyPass /.within.website/x/cmd/anubis/static/img/ !
+            Alias /.within.website/x/cmd/anubis/static/img/ /var/www/anubis/img/
+            <Directory /var/www/anubis/img>
+                Require all granted
+            </Directory>
+
+            ProxyPass / http://127.0.0.1:8923/
+            ProxyPassReverse / http://127.0.0.1:8923/
+
+            # Anubis and Drupal need the real Host; the blob proxy below
+            # must NOT send it, or Azure Storage rejects the request.
+            <Location />
+                ProxyPreserveHost On
+            </Location>
+            <Location /drupal-media/>
+                ProxyPreserveHost Off
+            </Location>
+        </IfFile>
+
+        <Location /health>
+            SetHandler none
+            Require all granted
+        </Location>
+
+        # Reverse proxy for Azure Blob Storage files (private container, SAS auth)
+        SSLProxyEngine On
+        RewriteEngine On
+        RewriteCond %%{REQUEST_URI} ^/drupal-media/
+        RewriteRule ^/drupal-media/(.*)$ https://${storage_account}.blob.core.windows.net/drupal-media/$1${storage_sas_token} [P,L,NE,E=proxy-nocanon:1]
+
+        Header always set X-Frame-Options "SAMEORIGIN"
+        Header always set X-Content-Type-Options "nosniff"
+        Header always set X-XSS-Protection "1; mode=block"
+        Header always set Strict-Transport-Security "max-age=300"
+
+        ErrorLog /var/log/httpd/drupal-ssl-error.log
+        CustomLog /var/log/httpd/drupal-ssl-access.log combined
+        ProxyTimeout 300
+    </VirtualHost>
+    SSLCONF
+
+  # Replace HTTP vhost with redirect to HTTPS (keep /health for probes)
+  - |
+    cat > /etc/httpd/conf.d/drupal.conf <<'REDIRECTCONF'
+    <VirtualHost *:80>
+        RewriteEngine On
+        RewriteCond %%{REQUEST_URI} !^/health
+        RewriteRule ^(.*)$ https://%%{HTTP_HOST}$1 [R=301,L]
+
+        <Location /health>
+            SetHandler none
+            Require all granted
+        </Location>
+    </VirtualHost>
+    REDIRECTCONF
+
+  # Wait for database connection (sync may have just completed)
+  - |
+    DRUPAL_ROOT="/var/www/drupal"
+    DRUSH="$DRUPAL_ROOT/vendor/bin/drush"
+    cd "$DRUPAL_ROOT"
+    echo "Waiting for database connection..." >> /var/log/cloud-init-output.log
+    for i in $(seq 1 30); do
+      if sudo -u drupal $DRUSH sql:query "SELECT 1" 2>/dev/null; then
+        echo "Database connection established (attempt $i)" >> /var/log/cloud-init-output.log
+        break
+      fi
+      echo "Waiting for database... (attempt $i/30)" >> /var/log/cloud-init-output.log
+      sleep 10
+    done
+
+  # Apply pending database updates, import config, and rebuild caches
+  - |
+    DRUPAL_ROOT="/var/www/drupal"
+    DRUSH="$DRUPAL_ROOT/vendor/bin/drush"
+    CONFIG_SYNC_DIR="$DRUPAL_ROOT/config"
+    cd "$DRUPAL_ROOT"
+    echo "Running database updates..." >> /var/log/cloud-init-output.log
+    sudo -u drupal $DRUSH updatedb -y >> /var/log/cloud-init-output.log 2>&1
+    sudo -u drupal $DRUSH cache:rebuild >> /var/log/cloud-init-output.log 2>&1
+    # az_blob_fs registers a stream wrapper that reads the key.key.azure_blob_key
+    # entity at construction (via the $config overrides in environment.php), so it
+    # cannot be installed by config:import's extension sync: the in-process install
+    # crashes drush ("You have requested a non-existent service") and aborts the
+    # import halfway, leaving every request fatal. Proven 2026-08-13 on the first
+    # dev deploy of the app-side blob wiring; this fix was rehearsed on the same
+    # VM. Install in separate drush processes, seeding the key entity the wrapper
+    # needs before it first boots. No-op once the DB has the modules.
+    if [ -d "$DRUPAL_ROOT/web/modules/contrib/az_blob_fs" ] && \
+       ! sudo -u drupal $DRUSH pm:list --status=enabled --field=name 2>/dev/null | grep -qx az_blob_fs; then
+      echo "Pre-installing key + az_blob_fs (config:import cannot install a stream-wrapper module)..." >> /var/log/cloud-init-output.log
+      sudo -u drupal $DRUSH en key -y >> /var/log/cloud-init-output.log 2>&1
+      if [ -f "$CONFIG_SYNC_DIR/key.key.azure_blob_key.yml" ]; then
+        SEED_DIR=$(mktemp -d)
+        cp "$CONFIG_SYNC_DIR/key.key.azure_blob_key.yml" "$SEED_DIR/"
+        chmod 755 "$SEED_DIR" && chmod 644 "$SEED_DIR/key.key.azure_blob_key.yml"
+        sudo -u drupal $DRUSH config:import --partial --source="$SEED_DIR" -y >> /var/log/cloud-init-output.log 2>&1
+        rm -rf "$SEED_DIR"
+      fi
+      sudo -u drupal $DRUSH en az_blob_fs -y >> /var/log/cloud-init-output.log 2>&1
+    fi
+    # Import config if config directory has files
+    if [ -f "$CONFIG_SYNC_DIR/system.site.yml" ]; then
+      echo "Importing configuration..." >> /var/log/cloud-init-output.log
+      # drush exits 0 on "no changes", so a nonzero status here is a real failure
+      # that leaves active config partial — say so in words the log grep gate matches.
+      sudo -u drupal $DRUSH config:import -y >> /var/log/cloud-init-output.log 2>&1 || {
+        echo "ERROR: config:import failed; active config may be partial" >> /var/log/cloud-init-output.log
+      }
+    else
+      echo "No config in sync directory, skipping import" >> /var/log/cloud-init-output.log
+    fi
+    echo "Rebuilding caches..." >> /var/log/cloud-init-output.log
+    sudo -u drupal $DRUSH cache:rebuild >> /var/log/cloud-init-output.log 2>&1
+    echo "Drupal update complete" >> /var/log/cloud-init-output.log
+
+  # Put Anubis in front of Drupal (needs the key from fetch-secrets.sh and the
+  # 443 vhost written above)
+  - /opt/anubis-setup.sh
+
+  # Restart web services after configuration
+  - systemctl restart php-fpm
+  - systemctl restart httpd
+
+  - echo "Cloud-init complete (dev environment)" >> /var/log/cloud-init-output.log

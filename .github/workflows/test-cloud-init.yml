@@ -1,0 +1,346 @@
+# ------------------------------------------------------------------------------
+# Test Cloud-Init Workflow
+# ------------------------------------------------------------------------------
+# Lightweight manual workflow for testing cloud-init changes on the dev VM
+# without triggering a full image build. Reuses an existing image from the
+# shared gallery and redeploys the dev environment.
+#
+# NOT part of the normal CI/CD pipeline. It exists for quick iteration on
+# cloud-init, Apache config, TLS, and other boot-time configuration.
+#
+# Usage:
+#   1. Actions > "Test Cloud-Init" > Run workflow
+#   2. Leave image_version empty to use the newest published app image, or pin one
+#   3. When done, re-run with destroy_only=true to clean up
+# ------------------------------------------------------------------------------
+
+name: Test Cloud-Init
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_version:
+        description: 'Existing image version (e.g. 0.0.42). Leave empty to use the newest.'
+        required: false
+        type: string
+      environment:
+        description: 'Which environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+      sync_database:
+        description: 'Sync the production DB to devtest before deploying'
+        required: false
+        default: true
+        type: boolean
+      destroy_only:
+        description: 'Only destroy resources (skip deploy)'
+        required: false
+        default: false
+        type: boolean
+
+# Shares the dev apply lock so this cannot race a dev-merge deploy.
+concurrency:
+  group: dev-merge-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ARM_USE_OIDC: true
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+
+  TF_VAR_project_name: ${{ vars.PROJECT_NAME }}
+  TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_location: ${{ vars.LOCATION }}
+  TF_VAR_cost_center: ${{ vars.COST_CENTER }}
+  TF_VAR_tfstate_resource_group_name: ${{ vars.TF_STATE_RESOURCE_GROUP }}
+  TF_VAR_tfstate_storage_account_name: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+  TF_VAR_admin_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+  TF_VAR_gallery_name: ${{ vars.GALLERY_NAME }}
+  TF_VAR_gallery_resource_group_name: ${{ vars.GALLERY_RESOURCE_GROUP }}
+  TF_VAR_image_name: ${{ vars.APP_IMAGE_NAME }}
+  TF_VAR_subnet_id: ${{ vars.SUBNET_ID }}
+  TF_VAR_devtest_db_host: ${{ vars.DEVTEST_DB_HOST }}
+  TF_VAR_devtest_storage_account: ${{ vars.DEVTEST_STORAGE_ACCOUNT }}
+
+jobs:
+  deploy-vm:
+    name: ${{ inputs.destroy_only && 'Destroy' || 'Deploy' }} ${{ inputs.environment }} VM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Azure Login
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # lib-main-infra makes this input mandatory, so testing cloud-init starts
+      # with a manual trip to the portal to look the version up. Resolving it
+      # here removes that step.
+      - name: Resolve image version
+        id: image
+        env:
+          OVERRIDE: ${{ inputs.image_version }}
+          GALLERY: ${{ vars.GALLERY_NAME }}
+          GALLERY_RG: ${{ vars.GALLERY_RESOURCE_GROUP }}
+          APP_IMAGE: ${{ vars.APP_IMAGE_NAME }}
+        run: |
+          if [ -n "$OVERRIDE" ]; then
+            echo "version=$OVERRIDE" >> "$GITHUB_OUTPUT"
+            echo "Using pinned image version: $OVERRIDE"
+            exit 0
+          fi
+
+          VERSION=$(az sig image-version list \
+            --gallery-name "$GALLERY" \
+            --gallery-image-definition "$APP_IMAGE" \
+            --resource-group "$GALLERY_RG" \
+            --query "sort_by([], &publishingProfile.publishedDate)[-1].name" -o tsv)
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::No $APP_IMAGE image found in the shared gallery"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Using newest image version: $VERSION"
+
+      - name: Start PostgreSQL if stopped
+        if: inputs.sync_database && !inputs.destroy_only
+        env:
+          SERVER_NAME: ${{ vars.PROJECT_NAME }}-devtest-psql
+          RG: ${{ vars.PROJECT_NAME }}-devtest-rg
+        run: |
+          STATE=""
+          for attempt in {1..5}; do
+            STATE=$(az postgres flexible-server show \
+              --name "$SERVER_NAME" --resource-group "$RG" \
+              --query "state" -o tsv 2>&1) && break
+            echo "Failed to query PostgreSQL state (attempt $attempt/5): $STATE"
+            sleep 15
+          done
+
+          if [ -z "$STATE" ] || echo "$STATE" | grep -qi "error"; then
+            echo "::error::Unable to query PostgreSQL server state after 5 attempts: $STATE"
+            exit 1
+          fi
+
+          echo "Current PostgreSQL state: $STATE"
+
+          if [ "$STATE" != "Ready" ]; then
+            echo "Starting PostgreSQL server..."
+            az postgres flexible-server start --name "$SERVER_NAME" --resource-group "$RG"
+
+            for i in {1..60}; do
+              STATE=$(az postgres flexible-server show \
+                --name "$SERVER_NAME" --resource-group "$RG" \
+                --query "state" -o tsv)
+              if [ "$STATE" == "Ready" ]; then
+                echo "PostgreSQL is ready (attempt $i)"
+                break
+              fi
+              echo "Waiting for PostgreSQL... (attempt $i/60, state: $STATE)"
+              sleep 10
+            done
+
+            if [ "$STATE" != "Ready" ]; then
+              echo "::error::PostgreSQL failed to start after 10 minutes"
+              exit 1
+            fi
+          fi
+
+      # The OIDC token from the job's first azure/login is valid for 5 minutes,
+      # and az needs it again to reach Key Vault (a new resource). Log in again
+      # so this step does not fail with AADSTS700024. See docs/TODO.md.
+      - name: Azure Login (refresh before Key Vault)
+        if: inputs.sync_database && !inputs.destroy_only
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sync production database to devtest
+        if: inputs.sync_database && !inputs.destroy_only
+        env:
+          PGSSLMODE: require
+          PROD_HOST: ${{ vars.PROD_DB_HOST }}
+          DEVTEST_HOST: ${{ vars.DEVTEST_DB_HOST }}
+          DB_USER: ${{ vars.DB_ADMIN_USERNAME }}
+          DB_NAME: ${{ vars.DB_NAME }}
+          SECRETS_RG: ${{ vars.PROJECT_NAME }}-secrets-rg
+          PG_MAJOR: ${{ vars.PG_MAJOR || '18' }}
+        run: |
+          # Client from PGDG pinned to the server major -- Ubuntu 24.04's default
+          # client is 16 and pg_dump refuses to read a newer server. Same reasoning
+          # as build-on-dispatch.yml; see the fuller comment there.
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --yes --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          echo "deb https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "postgresql-client-${PG_MAJOR}"
+
+          # Call the versioned binaries, not /usr/bin's pg_wrapper, and prove the
+          # major. dump-production-db.yml explains the trap this avoids.
+          export PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:$PATH"
+          ACTUAL=$(pg_dump --version | awk '{print $3}' | cut -d. -f1)
+          if [ "$ACTUAL" != "$PG_MAJOR" ]; then
+            echo "::error::pg_dump reports major $ACTUAL, expected $PG_MAJOR."
+            exit 1
+          fi
+
+          # Production and devtest have SEPARATE admin passwords -- same defect
+          # and same fix as build-on-dispatch.yml; see the fuller comment there.
+          KV_NAME=$(az keyvault list -g "$SECRETS_RG" --query "[0].name" -o tsv)
+          PROD_DB_PASSWORD=$(az keyvault secret show --vault-name "$KV_NAME" \
+            --name production-db-admin-password --query value -o tsv)
+          DEVTEST_DB_PASSWORD=$(az keyvault secret show --vault-name "$KV_NAME" \
+            --name devtest-db-admin-password --query value -o tsv)
+          echo "::add-mask::$PROD_DB_PASSWORD"
+          echo "::add-mask::$DEVTEST_DB_PASSWORD"
+
+          echo "Dumping production database..."
+          PGPASSWORD="$PROD_DB_PASSWORD" \
+            pg_dump -h "$PROD_HOST" -U "$DB_USER" -d "$DB_NAME" \
+            --format=custom --no-owner --no-acl -f /tmp/production.dump
+
+          # Everything below targets devtest, so switch credentials once here.
+          export PGPASSWORD="$DEVTEST_DB_PASSWORD"
+
+          echo "Terminating existing connections..."
+          psql -h "$DEVTEST_HOST" -U "$DB_USER" -d postgres \
+            -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$DB_NAME' AND pid <> pg_backend_pid();" || true
+
+          echo "Dropping and recreating the devtest database..."
+          psql -h "$DEVTEST_HOST" -U "$DB_USER" -d postgres -c "DROP DATABASE IF EXISTS $DB_NAME;"
+          psql -h "$DEVTEST_HOST" -U "$DB_USER" -d postgres -c "CREATE DATABASE $DB_NAME;"
+
+          echo "Restoring the production dump into devtest..."
+          pg_restore -h "$DEVTEST_HOST" -U "$DB_USER" -d "$DB_NAME" \
+            --no-owner --no-acl /tmp/production.dump
+
+          echo "Ensuring the pg_trgm extension exists..."
+          psql -h "$DEVTEST_HOST" -U "$DB_USER" -d "$DB_NAME" \
+            -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+
+          echo "Database sync complete"
+          rm -f /tmp/production.dump
+
+      - name: Terraform Init
+        working-directory: environments/${{ inputs.environment }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ inputs.environment }}/terraform.tfstate" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform Destroy
+        if: inputs.destroy_only
+        working-directory: environments/${{ inputs.environment }}
+        run: |
+          terraform destroy -auto-approve \
+            -var="image_version=${{ steps.image.outputs.version }}"
+
+      - name: Terraform Apply
+        if: "!inputs.destroy_only"
+        working-directory: environments/${{ inputs.environment }}
+        run: |
+          terraform apply -auto-approve \
+            -var="image_version=${{ steps.image.outputs.version }}" \
+            -replace="module.dev_vm.azurerm_linux_virtual_machine.dev"
+
+      - name: Get VM IP
+        if: "!inputs.destroy_only"
+        id: outputs
+        working-directory: environments/${{ inputs.environment }}
+        run: |
+          echo "public_ip=$(terraform output -raw public_ip_address)" >> "$GITHUB_OUTPUT"
+
+      - name: Health Check
+        if: "!inputs.destroy_only"
+        env:
+          VM_IP: ${{ steps.outputs.outputs.public_ip }}
+        run: |
+          # Two gates. /health does not bootstrap Drupal, so it stays 200 on a
+          # site that 500s everywhere - which is exactly what a cloud-init test
+          # needs to catch. See the 2026-08-13 entry in mccarthy-infra's docs/TODO.md.
+          echo "Waiting for the VM to boot and cloud-init to finish..."
+          echo "Gate 1/2: liveness at https://${VM_IP}/health"
+          for i in {1..30}; do
+            if curl -ksf --max-time 15 "https://${VM_IP}/health" > /dev/null; then
+              echo "  VM is serving"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::Health endpoint did not respond after 30 attempts"
+              exit 1
+            fi
+            echo "  waiting for VM... (attempt $i/30)"
+            sleep 10
+          done
+
+          echo "Gate 2/2: Drupal at https://${VM_IP}/user/login"
+          BODY="$RUNNER_TEMP/login.html"
+          for i in {1..10}; do
+            CODE=$(curl -ks -o "$BODY" -w '%{http_code}' --max-time 20 "https://${VM_IP}/user/login" || true)
+            [ -n "$CODE" ] || CODE="000"
+            if [ "$CODE" = "200" ] && grep -q 'user_login_form' "$BODY"; then
+              echo "  Drupal rendered the login form"
+              exit 0
+            fi
+            if [ "$i" -eq 10 ]; then
+              echo "::error::Drupal did not render /user/login (last status $CODE) - the site is broken even though /health is up"
+              echo "First 2000 bytes of the response:"
+              head -c 2000 "$BODY" || true
+              exit 1
+            fi
+            echo "  waiting for Drupal... (status $CODE, attempt $i/10)"
+            sleep 15
+          done
+
+      - name: Summary
+        if: always() && !inputs.destroy_only && steps.outputs.outputs.public_ip != ''
+        run: |
+          {
+            echo "## Test Cloud-Init Deploy"
+            echo ""
+            echo "**Environment:** ${{ inputs.environment }}"
+            echo "**VM IP:** ${{ steps.outputs.outputs.public_ip }}"
+            echo "**Image Version:** ${{ steps.image.outputs.version }}"
+            echo ""
+            echo "**HTTP:** http://${{ steps.outputs.outputs.public_ip }}"
+            echo "**HTTPS:** https://${{ steps.outputs.outputs.public_ip }}"
+            echo ""
+            echo "Remember to clean up: re-run this workflow with \`destroy_only=true\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Destroy Summary
+        if: inputs.destroy_only
+        run: |
+          {
+            echo "## Test Cloud-Init Cleanup"
+            echo ""
+            echo "**Environment:** ${{ inputs.environment }}"
+            echo "Resources destroyed."
+          } >> "$GITHUB_STEP_SUMMARY"

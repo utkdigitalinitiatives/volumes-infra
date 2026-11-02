@@ -1,0 +1,277 @@
+---
+# Drupal App Image Playbook
+# This playbook runs on top of the base image and adds Drupal-specific components.
+# System packages, PHP, and Apache are all pre-installed in the base image.
+# Estimated runtime: ~2-3 minutes (vs ~8 minutes with full provisioning)
+#
+# App-repo integration: when drupal_archive is provided the codebase is unpacked
+# from that tarball rather than scaffolded with composer create-project, so the
+# Drupal codebase stays in its own dev-owned repository. The tarball is built on
+# the runner from a deploy-key checkout of the PRIVATE app repo; this VM never
+# sees a credential. See packer/variables.pkr.hcl > drupal_archive.
+
+- name: Install and configure Drupal application
+  hosts: all
+  become: true
+
+  vars:
+    drupal_user: "drupal"
+    drupal_group: "drupal"
+    web_root: "/var/www/drupal"
+    drupal_version: "11"
+    # App-repo integration (passed from Packer): a path on the Ansible
+    # controller -- the GitHub runner -- not on this VM.
+    drupal_archive: ""
+
+  tasks:
+    # ==========================================================================
+    # Install Drupal - app repo tarball, or Composer create-project (fallback)
+    # ==========================================================================
+    # unarchive needs GNU tar on this VM. The shared base image installs unzip
+    # but does not name tar, so do not rely on the marketplace image having it.
+    - name: Ensure GNU tar is present for the unpack
+      ansible.builtin.dnf:
+        name: tar
+        state: present
+      when: drupal_archive | default('') | length > 0
+
+    # Unpacked as root, not become_user drupal: becoming an unprivileged user
+    # makes Ansible hand the uploaded tarball over through temp-file ACLs, which
+    # is a failure mode this one-shot build does not need. Ownership is fixed in
+    # the next task instead.
+    - name: Unpack the Drupal codebase from the app repository tarball
+      ansible.builtin.unarchive:
+        src: "{{ drupal_archive }}"
+        dest: "{{ web_root }}"
+        owner: "{{ drupal_user }}"
+        group: "{{ drupal_group }}"
+      when: drupal_archive | default('') | length > 0
+
+    - name: Hand the unpacked codebase to the drupal user
+      ansible.builtin.file:
+        path: "{{ web_root }}"
+        state: directory
+        owner: "{{ drupal_user }}"
+        group: "{{ drupal_group }}"
+        recurse: true
+      when: drupal_archive | default('') | length > 0
+
+    # The base image registers web_root(/.*)? as httpd_sys_rw_content_t, and
+    # files created in place inherit it. This makes sure nothing the unpack
+    # wrote kept a temp-directory label, which php-fpm would be denied.
+    - name: Restore SELinux labels on the unpacked codebase
+      ansible.builtin.command: "restorecon -R {{ web_root }}"
+      changed_when: false
+      when: drupal_archive | default('') | length > 0
+
+    - name: Install Drupal project via Composer (fallback when no repo provided)
+      ansible.builtin.command:
+        cmd: /usr/local/bin/composer create-project drupal/recommended-project:^{{ drupal_version }} .
+        chdir: "{{ web_root }}"
+        creates: "{{ web_root }}/composer.json"
+      become: true
+      become_user: "{{ drupal_user }}"
+      environment:
+        COMPOSER_HOME: "/tmp/composer-{{ drupal_user }}"
+      when: drupal_archive | default('') | length == 0
+
+    # drupal/recommended-project does not bundle Drush, and the app repo's own
+    # composer.lock is what supplies it on the tarball path. The fallback has to ask
+    # for it explicitly or the symlink task below fails with "src file does not
+    # exist" -- cloud-init drives the entire site install through drush, so an
+    # image without it is useless.
+    - name: Add Drush to the scaffolded project (fallback only)
+      ansible.builtin.command:
+        cmd: /usr/local/bin/composer require drush/drush --no-interaction
+        chdir: "{{ web_root }}"
+        creates: "{{ web_root }}/vendor/bin/drush"
+      become: true
+      become_user: "{{ drupal_user }}"
+      environment:
+        COMPOSER_HOME: "/tmp/composer-{{ drupal_user }}"
+      when: drupal_archive | default('') | length == 0
+
+    # ==========================================================================
+    # Install dependencies from composer.lock (app repo tarball only)
+    # ==========================================================================
+    - name: Install dependencies from composer.lock
+      ansible.builtin.command:
+        cmd: /usr/local/bin/composer install --no-dev --optimize-autoloader
+        chdir: "{{ web_root }}"
+      become: true
+      become_user: "{{ drupal_user }}"
+      environment:
+        COMPOSER_HOME: "/tmp/composer-{{ drupal_user }}"
+      when: drupal_archive | default('') | length > 0
+
+    # ==========================================================================
+    # Drupal directory structure
+    # ==========================================================================
+    - name: Create Drupal files directory
+      ansible.builtin.file:
+        path: "{{ web_root }}/web/sites/default/files"
+        state: directory
+        owner: "{{ drupal_user }}"
+        group: "{{ drupal_group }}"
+        mode: "0775"
+
+    - name: Create Drupal private files directory
+      ansible.builtin.file:
+        path: "{{ web_root }}/private"
+        state: directory
+        owner: "{{ drupal_user }}"
+        group: "{{ drupal_group }}"
+        mode: "0770"
+
+    - name: Create Drupal config sync directory
+      ansible.builtin.file:
+        path: "{{ web_root }}/config"
+        state: directory
+        owner: "{{ drupal_user }}"
+        group: "{{ drupal_group }}"
+        mode: "0775"
+
+    # ==========================================================================
+    # Drupal settings configuration
+    # ==========================================================================
+    - name: Copy default settings.php
+      ansible.builtin.copy:
+        src: "{{ web_root }}/web/sites/default/default.settings.php"
+        dest: "{{ web_root }}/web/sites/default/settings.php"
+        owner: "{{ drupal_user }}"
+        group: "{{ drupal_group }}"
+        mode: "0644"
+        remote_src: true
+        force: false
+
+    - name: Add environment-based configuration to settings.php
+      ansible.builtin.blockinfile:
+        path: "{{ web_root }}/web/sites/default/settings.php"
+        marker: "# {mark} ANSIBLE MANAGED - Environment Configuration"
+        block: |
+          /**
+           * Load database credentials from environment config file.
+           * This file is populated by cloud-init at boot time.
+           */
+          $drupal_env_file = '/etc/drupal/environment.php';
+          if (file_exists($drupal_env_file)) {
+            require_once $drupal_env_file;
+          }
+
+          /**
+           * Config sync directory.
+           */
+          $settings['config_sync_directory'] = '../config';
+
+          /**
+           * Private file path.
+           */
+          $settings['file_private_path'] = '../private';
+
+          /**
+           * Trusted host patterns - configured via environment.php
+           */
+          if (isset($trusted_host_patterns)) {
+            $settings['trusted_host_patterns'] = $trusted_host_patterns;
+          }
+
+          /**
+           * Hash salt - must be set via environment.php
+           */
+          if (isset($hash_salt)) {
+            $settings['hash_salt'] = $hash_salt;
+          }
+
+    - name: Create environment.php placeholder
+      ansible.builtin.template:
+        src: templates/drupal-environment.php.j2
+        dest: /etc/drupal/environment.php
+        owner: root
+        group: "{{ drupal_group }}"
+        mode: "0640"
+
+    # ==========================================================================
+    # Drush CLI symlink
+    # ==========================================================================
+    - name: Create symlink for drush
+      ansible.builtin.file:
+        src: "{{ web_root }}/vendor/bin/drush"
+        dest: /usr/local/bin/drush
+        state: link
+
+    # ==========================================================================
+    # Health check endpoint
+    # ==========================================================================
+    - name: Create health check endpoint
+      ansible.builtin.copy:
+        content: "OK"
+        dest: "{{ web_root }}/web/health"
+        owner: "{{ drupal_user }}"
+        group: "{{ drupal_group }}"
+        mode: "0644"
+
+    # ==========================================================================
+    # Anubis bot-protection proxy
+    # ==========================================================================
+    # Installed and configured here, but NOT enabled: /opt/anubis-setup.sh in
+    # cloud-init starts anubis@drupal at boot once the signing key is fetched
+    # from Key Vault, and it switches Apache onto Anubis only if Anubis answers.
+    # An image without these tasks still boots and serves Drupal directly.
+    - name: Download the Anubis RPM
+      ansible.builtin.get_url:
+        url: "https://github.com/TecharoHQ/anubis/releases/download/v{{ anubis_version }}/anubis-{{ anubis_version }}-1.x86_64.rpm"
+        dest: "/tmp/anubis-{{ anubis_version }}.rpm"
+        checksum: "sha256:{{ anubis_rpm_sha256 }}"
+        mode: "0644"
+
+    # The RPM is not GPG-signed (upstream publishes a detached .asc instead);
+    # the SHA256 check above is what pins it.
+    - name: Install Anubis
+      ansible.builtin.dnf:
+        name: "/tmp/anubis-{{ anubis_version }}.rpm"
+        state: present
+        disable_gpg_check: true
+
+    - name: Install the Drupal bot policy
+      ansible.builtin.copy:
+        src: files/anubis/drupal.botPolicies.yaml
+        dest: /etc/anubis/drupal.botPolicies.yaml
+        owner: root
+        group: root
+        mode: "0644"
+
+    # UT Power T in place of the Anubis mascot, as on digital.lib.utk.edu. The
+    # images are compiled into the binary, so Apache serves these files under
+    # the same URLs instead (see the Anubis block in the 443 vhost). One image
+    # for all three states: challenge running, passed, and denied.
+    - name: Create the Anubis challenge image directory
+      ansible.builtin.file:
+        path: /var/www/anubis/img
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the Power T as each Anubis challenge image
+      ansible.builtin.copy:
+        src: files/anubis/power-t.webp
+        dest: "/var/www/anubis/img/{{ item }}.webp"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - pensive
+        - happy
+        - reject
+
+    # Apache has to connect to Anubis on 127.0.0.1:8923. The /drupal-media/
+    # blob proxy already needs this boolean, but that is the base image's
+    # business; set it here so Anubis does not depend on it.
+    - name: Check whether httpd may open network connections
+      ansible.builtin.command: getsebool httpd_can_network_connect
+      register: httpd_network_bool
+      changed_when: false
+
+    - name: Allow httpd to open network connections
+      ansible.builtin.command: setsebool -P httpd_can_network_connect 1
+      when: "'--> on' not in httpd_network_bool.stdout"

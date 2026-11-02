@@ -1,0 +1,258 @@
+name: Deploy to Production
+
+# Manual production deploy. Use for rollback or emergency: pass the exact image
+# version you want live. The normal path is deploy-on-main-merge.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_version:
+        description: 'Image version to deploy (e.g. 0.0.42)'
+        required: true
+        type: string
+
+# Shares a concurrency group with deploy-on-main-merge.yml so a manual rollback
+# and an automatic deploy can never apply against production at the same time.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ARM_USE_OIDC: true
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+
+  TF_VAR_project_name: ${{ vars.PROJECT_NAME }}
+  TF_VAR_storage_prefix: ${{ vars.STORAGE_PREFIX }}
+  TF_VAR_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_location: ${{ vars.LOCATION }}
+  TF_VAR_cost_center: ${{ vars.COST_CENTER }}
+  TF_VAR_tfstate_resource_group_name: ${{ vars.TF_STATE_RESOURCE_GROUP }}
+  TF_VAR_tfstate_storage_account_name: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+  TF_VAR_use_gallery_image: "true"
+  TF_VAR_gallery_name: ${{ vars.GALLERY_NAME }}
+  TF_VAR_gallery_resource_group_name: ${{ vars.GALLERY_RESOURCE_GROUP }}
+  TF_VAR_image_name: ${{ vars.APP_IMAGE_NAME }}
+  TF_VAR_lb_dns_label: ${{ vars.LB_DNS_LABEL }}
+  TF_VAR_admin_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+  TF_VAR_enable_vmss_blob_access: "true"
+  TF_VAR_drupal_site_uuid: ${{ vars.DRUPAL_SITE_UUID }}
+  TF_VAR_enable_https: "true"
+  TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+  TF_VAR_public_ip_id: ${{ vars.PUBLIC_IP_ID }}
+  # Same PG_MAJOR that pins the pg_dump client in build-on-dispatch.yml, so the
+  # server major and the client major cannot drift apart.
+  TF_VAR_postgresql_version: ${{ vars.PG_MAJOR || '18' }}
+
+jobs:
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Azure Login
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: environments/production
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=production/terraform.tfstate" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform Plan
+        working-directory: environments/production
+        run: |
+          terraform plan \
+            -var="image_version=${{ inputs.image_version }}" \
+            -out=tfplan
+
+      - name: Terraform Apply (Rolling Update)
+        working-directory: environments/production
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get VMSS Details
+        id: vmss
+        working-directory: environments/production
+        run: |
+          {
+            echo "vmss_name=$(terraform output -raw vmss_name)"
+            echo "vmss_id=$(terraform output -raw vmss_id)"
+            echo "resource_group_name=$(terraform output -raw resource_group_name)"
+            echo "application_url=$(terraform output -raw application_url)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Monitor Rolling Update
+        run: |
+          echo "Monitoring rolling update for VMSS: ${{ steps.vmss.outputs.vmss_name }}"
+
+          for i in {1..60}; do
+            STATUS=$(az vmss get-instance-view \
+              --name "${{ steps.vmss.outputs.vmss_name }}" \
+              --resource-group "${{ steps.vmss.outputs.resource_group_name }}" \
+              --query "statuses[?code=='ProvisioningState/succeeded'].code" \
+              -o tsv 2>/dev/null || echo "pending")
+
+            if [ "$STATUS" == "ProvisioningState/succeeded" ]; then
+              echo "Rolling update completed successfully!"
+              break
+            fi
+
+            echo "Update in progress... (check $i/60)"
+            sleep 30
+          done
+
+      - name: Health Check
+        env:
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+          APP_URL: ${{ steps.vmss.outputs.application_url }}
+        run: |
+          # Three gates, identical to deploy-on-main-merge.yml. /health alone has
+          # passed two broken deploys: Apache serves it without bootstrapping
+          # Drupal, and it is exempt from the HTTPS redirect.
+          if [ -n "$DOMAIN_NAME" ]; then
+            HTTP_BASE="http://$DOMAIN_NAME"
+            HTTPS_BASE="https://$DOMAIN_NAME"
+          else
+            HTTP_BASE="$APP_URL"
+            HTTPS_BASE=""
+          fi
+
+          # 1. Liveness over plain HTTP, so a warming certificate does not fail it.
+          echo "Gate 1/3: liveness at $HTTP_BASE/health"
+          for i in {1..10}; do
+            if curl -sf --max-time 15 "$HTTP_BASE/health" > /dev/null; then
+              echo "  instance is serving"
+              break
+            fi
+            if [ "$i" -eq 10 ]; then
+              echo "::error::Health endpoint did not respond within timeout"
+              exit 1
+            fi
+            echo "  waiting for the instance... (attempt $i/10)"
+            sleep 30
+          done
+
+          # 2. TLS. Gate 1 cannot see a missing or refused certificate at all.
+          if [ -n "$HTTPS_BASE" ]; then
+            echo "Gate 2/3: TLS at $HTTPS_BASE/health"
+            for i in {1..10}; do
+              if curl -sf --max-time 15 "$HTTPS_BASE/health" > /dev/null; then
+                echo "  HTTPS is serving with a valid certificate"
+                break
+              fi
+              if [ "$i" -eq 10 ]; then
+                echo "::error::HTTPS is not serving - the certificate was not restored or reissued"
+                exit 1
+              fi
+              echo "  waiting for TLS... (attempt $i/10)"
+              sleep 15
+            done
+            DRUPAL_BASE="$HTTPS_BASE"
+          else
+            echo "Gate 2/3: skipped - no domain name is set, so there is no certificate"
+            DRUPAL_BASE="$HTTP_BASE"
+          fi
+
+          # 3. Drupal. /user/login renders the full stack and is never cached.
+          echo "Gate 3/3: Drupal at $DRUPAL_BASE/user/login"
+          BODY="$RUNNER_TEMP/login.html"
+          for i in {1..10}; do
+            CODE=$(curl -s -o "$BODY" -w '%{http_code}' --max-time 20 "$DRUPAL_BASE/user/login" || true)
+            [ -n "$CODE" ] || CODE="000"
+            if [ "$CODE" = "200" ] && grep -q 'user_login_form' "$BODY"; then
+              echo "  Drupal rendered the login form"
+              exit 0
+            fi
+            if [ "$i" -eq 10 ]; then
+              echo "::error::Drupal did not render /user/login (last status $CODE) - the site is broken even though /health is up"
+              echo "First 2000 bytes of the response:"
+              head -c 2000 "$BODY" || true
+              exit 1
+            fi
+            echo "  waiting for Drupal... (status $CODE, attempt $i/10)"
+            sleep 15
+          done
+
+      - name: Deployment Summary
+        if: always() && steps.vmss.outputs.application_url != ''
+        run: |
+          {
+            echo "## Production Deployment Complete"
+            echo ""
+            echo "**Image Version:** ${{ inputs.image_version }}"
+            echo "**VMSS:** ${{ steps.vmss.outputs.vmss_name }}"
+            echo "**Application URL:** ${{ steps.vmss.outputs.application_url }}"
+            echo ""
+            echo "Rolling update completed. Verify the application at the URL above."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The OIDC token from the job's first azure/login is valid for 5 minutes,
+      # and az needs it again to reach Key Vault (a new resource). Log in again
+      # so this step does not fail with AADSTS700024. See docs/TODO.md.
+      - name: Azure Login (refresh before Key Vault)
+        if: always() && steps.vmss.outputs.application_url != ''
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Fetch Postmark token from Key Vault
+        if: always() && steps.vmss.outputs.application_url != ''
+        env:
+          SECRETS_RG: ${{ vars.PROJECT_NAME }}-secrets-rg
+        run: |
+          KV_NAME=$(az keyvault list -g "$SECRETS_RG" --query "[0].name" -o tsv)
+          TOKEN=$(az keyvault secret show --vault-name "$KV_NAME" \
+            --name shared-postmark-api-token --query value -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "POSTMARK_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      # A manual production deploy is a rollback or an emergency, so the team
+      # needs to hear about it more than they need to hear about a routine
+      # merge. This mirrors the notification in deploy-on-main-merge.yml and
+      # adds who started it, which only exists on the manual path.
+      - name: Email Notification - Manual Production Deploy
+        if: always() && steps.vmss.outputs.application_url != ''
+        uses: dawidd6/action-send-mail@v18
+        with:
+          server_address: smtp.postmarkapp.com
+          server_port: 587
+          username: ${{ env.POSTMARK_TOKEN }}
+          password: ${{ env.POSTMARK_TOKEN }}
+          subject: "Manual Production Deploy ${{ job.status == 'success' && 'Complete' || 'Failed' }} - ${{ inputs.image_version }}"
+          to: ${{ vars.NOTIFY_EMAIL_TO }}
+          from: ${{ vars.NOTIFY_EMAIL_FROM }}
+          body: |
+            Manual production deployment ${{ job.status }}.
+
+            Started by: ${{ github.actor }}
+            Application URL: ${{ steps.vmss.outputs.application_url }}
+            Image Version: ${{ inputs.image_version }}
+
+            View workflow run:
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        continue-on-error: true
