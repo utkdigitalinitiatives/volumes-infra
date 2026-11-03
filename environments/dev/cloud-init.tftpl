@@ -168,6 +168,10 @@ write_files:
               SetHandler "proxy:unix:/run/php-fpm/drupal.sock|fcgi://localhost"
           </FilesMatch>
 
+          # Same as the 443 vhost. Without it Apache's 60 s default applies
+          # here and cuts off long PHP requests, such as a large ZIP upload.
+          ProxyTimeout 300
+
           # Every request here comes from Anubis, so log the client it saw.
           LogFormat "%%{X-Real-Ip}i %l %u %t \"%r\" %>s %b \"%%{Referer}i\" \"%%{User-Agent}i\"" anubis_backend
           ErrorLog /var/log/httpd/drupal-backend-error.log
