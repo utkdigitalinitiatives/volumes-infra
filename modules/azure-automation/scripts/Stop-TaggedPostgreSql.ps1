@@ -36,7 +36,9 @@ $failed = @()
 
 foreach ($server in $servers) {
     $name = $server.Name
-    $rg = $server.ResourceGroupName
+    # The server object has no ResourceGroupName property, so take it from the
+    # resource ID: /subscriptions/<sub>/resourceGroups/<rg>/providers/...
+    $rg = ($server.Id -split '/')[4]
     $state = $server.State
 
     if ($state -eq "Ready") {

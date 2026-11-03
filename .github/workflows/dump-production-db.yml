@@ -76,13 +76,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # production-schedule.yml deallocates this server overnight and at
-          # weekends. Fail here with the remedy rather than 60 seconds later
+          # Production should always be running. If someone stopped this
+          # server, fail here with the remedy rather than 60 seconds later
           # inside pg_dump with a connection timeout that reads like an outage.
           #
           # Retried because the Azure API returns transient GatewayTimeouts
-          # against a deallocated Flexible Server -- same reason
-          # production-schedule.yml retries.
+          # against a stopped Flexible Server.
           STATE=""
           for attempt in {1..5}; do
             STATE=$(az postgres flexible-server show \
@@ -98,7 +97,7 @@ jobs:
           fi
 
           if [ "$STATE" != "Ready" ]; then
-            echo "::error::$PSQL_NAME is '$STATE', not 'Ready'. Production is deallocated outside business hours. Run the 'Production Start/Stop Schedule' workflow with action=start, wait for it to finish, then re-run this one."
+            echo "::error::$PSQL_NAME is '$STATE', not 'Ready'. Production should always be running. Start it with 'az postgres flexible-server start --resource-group $PROD_RG --name $PSQL_NAME', then re-run this one."
             exit 1
           fi
 

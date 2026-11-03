@@ -3,8 +3,8 @@
 Infrastructure as Code for the `volumes` Drupal site ("Volumes | UTK Libraries").
 
 **Status: scaffolded, never run.** Nothing exists in Azure yet, no pipeline has
-executed, and this repository has not been pushed to GitHub. It was built on
-2026-10-14 from [mccarthy-infra](https://github.com/utkdigitalinitiatives/mccarthy-infra)
+executed. The repository is on GitHub (public), with the scaffold committed
+on 2026-11-02 as `f46b550`. It was built on 2026-10-14 from [mccarthy-infra](https://github.com/utkdigitalinitiatives/mccarthy-infra)
 at commit `283390b`. See [docs/bootstrap-runbook.md](docs/bootstrap-runbook.md)
 for how to stand it up and [docs/TODO.md](docs/TODO.md) for what is open.
 
@@ -53,8 +53,7 @@ app repo: dev -> main     --(drupal-main-merge)--> resolve newest gallery image
 - TLS via Let's Encrypt on the VM (not on the load balancer), with certs
   persisted to blob storage so they survive reimages
 
-Region `eastus2`. Production is deallocated overnight and at weekends by
-`production-schedule.yml`; disable that workflow once the site is public-facing.
+Region `eastus2`. Production runs all the time; there is no start/stop schedule.
 
 **Not carried over from mccarthy-infra: Solr.** This site has no `search_api`,
 so there is no VNet peering to Asimov, no `search.utklib.internal` zone, no Solr
@@ -145,8 +144,7 @@ volumes-infra/
 │       ├── deploy-on-main-merge.yml   # drupal-main-merge -> production rolling deploy, destroy dev VM
 │       ├── deploy-production.yml      # manual rollback / emergency deploy
 │       ├── test-cloud-init.yml        # manual cloud-init iteration on an existing image
-│       ├── dump-production-db.yml     # manual -> production dump into private blob, for local DDEV
-│       └── production-schedule.yml    # nightly/weekend deallocate (cost control)
+│       └── dump-production-db.yml     # manual -> production dump into private blob, for local DDEV
 ├── packer/
 │   ├── plugins.pkr.hcl
 │   ├── variables.pkr.hcl
