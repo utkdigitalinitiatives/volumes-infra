@@ -11,7 +11,7 @@ order that actually works there, not the order they were first written in.
 
 | Step | State |
 |---|---|
-| 0. GitHub repo + environments | not started |
+| 0. GitHub repo + environments | repo created and pushed (public, `f46b550`, 2026-11-02); environments not checked |
 | 1. Bootstrap script | not started |
 | 2. Repo secrets, variables, deploy key | not started |
 | 3. `environments/secrets` | not started |
@@ -53,6 +53,10 @@ stops rather than guess.
 ```bash
 gh repo create utkdigitalinitiatives/volumes-infra --public   # or --private; see below
 ```
+
+Already done: the repo exists, is public, and has the scaffold commit pushed
+(`f46b550`, 2026-11-02). The rest of this step — the environments — has not been
+checked.
 
 Public or private is a real choice. mccarthy-infra is public, and everything
 here is written as if this repo is too: no secrets in git, tfvars ignored, the
@@ -375,8 +379,10 @@ gh workflow enable "Production Start/Stop Schedule"
 
 GitHub cron is always UTC, so the local window shifts an hour across DST.
 Weekdays only: production is off from Friday evening until Monday morning.
-Disable the workflow for good once the site is public-facing — mccarthy did on
-2026-10-01, before its go-live.
+The schedule stays on while the site is in development. At go-live, delete
+`production-schedule.yml`, as mccarthy did on 2026-10-01 (`dd92698`): a public
+site cannot go dark every evening. Then update `dump-production-db.yml`'s
+state-check comments and error text, the README, and this step.
 
 `ACTION` falls through to `stop` for any trigger that is not the start cron, so
 editing the start cron string without also editing the `ACTION` expression

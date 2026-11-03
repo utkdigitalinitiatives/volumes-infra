@@ -67,8 +67,9 @@ $config['az_blob_fs.settings']['az_blob_container_name'] = getenv('AZ_BLOB_CONTA
 $config['az_blob_fs.settings']['az_blob_protocol'] = 'https';
 $config['az_blob_fs.settings']['az_blob_cdn_host_name'] = getenv('AZ_BLOB_CDN_HOST') ?: '';
 
-// Default file scheme
-$settings['file_default_scheme'] = 'azblob';
+// The default file scheme is config, not a setting: system.file
+// default_scheme in the app repo's config/system.file.yml. Drupal 8+
+// never reads $settings['file_default_scheme'].
 
 /**
  * Environment indicator.

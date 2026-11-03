@@ -73,7 +73,14 @@ resource "azurerm_postgresql_flexible_server" "main" {
 
   # Zone is auto-assigned by Azure if not specified and cannot be changed after creation
   lifecycle {
-    ignore_changes = [zone]
+    ignore_changes = [
+      zone,
+      # OIT governance owns these tags: a CostCenter policy (modify) and Event
+      # Grid auto-tagging on every create/update. Ours still apply on create.
+      tags["CostCenter"],
+      tags["CreatorUPN"], tags["CreatorName"], tags["CreatorObjectID"], tags["CreationTimeStamp"],
+      tags["LastModifierUPN"], tags["LastModifierName"], tags["LastModifierObjectID"], tags["LastModifiedTimeStamp"],
+    ]
   }
 }
 

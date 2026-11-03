@@ -41,6 +41,16 @@ resource "azurerm_virtual_network" "main" {
   resource_group_name = var.resource_group_name
 
   tags = local.common_tags
+
+  lifecycle {
+    ignore_changes = [
+      # OIT governance owns these tags: a CostCenter policy (modify) and Event
+      # Grid auto-tagging on every create/update. Ours still apply on create.
+      tags["CostCenter"],
+      tags["CreatorUPN"], tags["CreatorName"], tags["CreatorObjectID"], tags["CreationTimeStamp"],
+      tags["LastModifierUPN"], tags["LastModifierName"], tags["LastModifierObjectID"], tags["LastModifiedTimeStamp"],
+    ]
+  }
 }
 
 # Web Subnet (for VMSS Blue/Green)
@@ -69,6 +79,16 @@ resource "azurerm_network_security_group" "web" {
   resource_group_name = var.resource_group_name
 
   tags = local.common_tags
+
+  lifecycle {
+    ignore_changes = [
+      # OIT governance owns these tags: a CostCenter policy (modify) and Event
+      # Grid auto-tagging on every create/update. Ours still apply on create.
+      tags["CostCenter"],
+      tags["CreatorUPN"], tags["CreatorName"], tags["CreatorObjectID"], tags["CreationTimeStamp"],
+      tags["LastModifierUPN"], tags["LastModifierName"], tags["LastModifierObjectID"], tags["LastModifiedTimeStamp"],
+    ]
+  }
 }
 
 # NSG Rule: Allow HTTP from Azure Front Door
@@ -201,6 +221,16 @@ resource "azurerm_network_security_group" "private_endpoints" {
   resource_group_name = var.resource_group_name
 
   tags = local.common_tags
+
+  lifecycle {
+    ignore_changes = [
+      # OIT governance owns these tags: a CostCenter policy (modify) and Event
+      # Grid auto-tagging on every create/update. Ours still apply on create.
+      tags["CostCenter"],
+      tags["CreatorUPN"], tags["CreatorName"], tags["CreatorObjectID"], tags["CreationTimeStamp"],
+      tags["LastModifierUPN"], tags["LastModifierName"], tags["LastModifierObjectID"], tags["LastModifiedTimeStamp"],
+    ]
+  }
 }
 
 # Associate NSG with Private Endpoints Subnet

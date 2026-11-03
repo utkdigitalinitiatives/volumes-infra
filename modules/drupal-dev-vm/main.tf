@@ -46,6 +46,16 @@ resource "azurerm_public_ip" "dev" {
   sku                 = "Standard"
 
   tags = local.common_tags
+
+  lifecycle {
+    ignore_changes = [
+      # OIT governance owns these tags: a CostCenter policy (modify) and Event
+      # Grid auto-tagging on every create/update. Ours still apply on create.
+      tags["CostCenter"],
+      tags["CreatorUPN"], tags["CreatorName"], tags["CreatorObjectID"], tags["CreationTimeStamp"],
+      tags["LastModifierUPN"], tags["LastModifierName"], tags["LastModifierObjectID"], tags["LastModifiedTimeStamp"],
+    ]
+  }
 }
 
 # Network Interface
@@ -62,6 +72,16 @@ resource "azurerm_network_interface" "dev" {
   }
 
   tags = local.common_tags
+
+  lifecycle {
+    ignore_changes = [
+      # OIT governance owns these tags: a CostCenter policy (modify) and Event
+      # Grid auto-tagging on every create/update. Ours still apply on create.
+      tags["CostCenter"],
+      tags["CreatorUPN"], tags["CreatorName"], tags["CreatorObjectID"], tags["CreationTimeStamp"],
+      tags["LastModifierUPN"], tags["LastModifierName"], tags["LastModifierObjectID"], tags["LastModifiedTimeStamp"],
+    ]
+  }
 }
 
 # Associate NIC with Application Security Groups
@@ -135,4 +155,14 @@ resource "azurerm_linux_virtual_machine" "dev" {
   }
 
   tags = local.common_tags
+
+  lifecycle {
+    ignore_changes = [
+      # OIT governance owns these tags: a CostCenter policy (modify) and Event
+      # Grid auto-tagging on every create/update. Ours still apply on create.
+      tags["CostCenter"],
+      tags["CreatorUPN"], tags["CreatorName"], tags["CreatorObjectID"], tags["CreationTimeStamp"],
+      tags["LastModifierUPN"], tags["LastModifierName"], tags["LastModifierObjectID"], tags["LastModifiedTimeStamp"],
+    ]
+  }
 }

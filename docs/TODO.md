@@ -12,11 +12,11 @@ Look there before "fixing" something that looks odd.
 
 ---
 
-## Work in flight — scaffold written 2026-10-14, nothing applied, nothing pushed
+## Work in flight — scaffold written 2026-10-14, pushed 2026-11-02, nothing applied
 
 | What | State |
 |---|---|
-| Repo scaffold, copied from mccarthy-infra `283390b` and adapted | written; `git init` done, **no commit yet**; GitHub repo `utkdigitalinitiatives/volumes-infra` **not created** (checked 2026-10-14) |
+| Repo scaffold, copied from mccarthy-infra `283390b` and adapted | committed as `f46b550` and pushed to `utkdigitalinitiatives/volumes-infra` (public) on 2026-11-02 |
 | Azure | nothing exists — no `volumes-*` resource groups (checked 2026-10-14) |
 | `terraform validate` on all four environments | passes (2026-10-14, Terraform 1.5.7, `-backend=false`) |
 | `terraform fmt`, `packer validate`, `actionlint`, `shellcheck bootstrap/` | all pass |
@@ -24,13 +24,52 @@ Look there before "fixing" something that looks odd.
 | First-boot install identity, asked for by a volumes dev 2026-10-14: site name `Volumes \| UTK Libraries`, site and super-user mail `librarieswebsite@utk.edu`, super user `admin` | done as `drupal_site_name` / `drupal_site_mail` / `drupal_admin_username` / `drupal_admin_mail` in `environments/production`; rendered `site:install` line checked, validations tested. Not yet reported back to the dev. |
 | Everything else | never run — see `docs/bootstrap-runbook.md` |
 
-**Resume here:** review the untracked tree, decide whether this repo is public,
-then runbook step 0 (create the GitHub repo, first commit and push, disable the
-schedule workflow at once, create the `production` and `dev` environments).
+**Resume here:** runbook step 0 (the repo is created and pushed; disable the
+schedule workflow at once and create the `production` and `dev` environments),
+after syncing with mccarthy-infra's
+fixes since `283390b` — see the first entry under Open.
 
 ---
 
 ## Open
+
+### Sync with mccarthy-infra fixes made after `283390b`
+
+This repo was copied from mccarthy-infra `283390b`; mccarthy-infra was at
+`932ac41` on 2026-11-03. The commits in between are brought over in two PRs.
+Done in the first: OIT tag `ignore_changes` on `modules/` and
+`environments/secrets` (PR #8), the automation runbook on the PowerShell-7.2
+runtime environment plus the `ResourceGroupName` fix (PR #9), and dropping the inert
+`$settings['file_default_scheme']` from the Packer `environment.php`.
+
+Still to port, none of it applies cleanly because this repo diverged there:
+
+- **Install-vs-update guard** (`ccb1a10`, PR #10). `/opt/drupal-init.sh` decides
+  "installed" with `drush status`; a database Drupal cannot boot falls through
+  to `site:install`, which drops every table. mccarthy counts tables with
+  `sql:query` instead and refuses to guess. Same commit: `pipefail`, no
+  `grep -q` under it, and a fatal `updatedb`.
+- **Admin password out of `custom_data`.** Pass the Key Vault secret name, not
+  the password; `fetch-secrets.sh` writes it to a root-only file.
+- **Gallery publish** (PR #7). Packer's own publish fails on the transient state
+  OIT auto-tagging leaves a new managed image in. Needs
+  `.github/scripts/gallery-publish.sh`, the new steps in
+  `build-on-dispatch.yml`, and removing `shared_image_gallery_destination` from
+  the Packer source — these three go together.
+- **Container SAS for media** in `environments/production` (the account SAS also
+  reads the `tls-certs` container, private key included).
+- `azurerm_storage_account.private_files` needs the OIT tag `ignore_changes`.
+- `ProxyTimeout 300` on the `127.0.0.1:8008` backend vhost, both cloud-inits.
+- TLS: the renewal hook reads `$RENEWED_DOMAINS` (a list) — use
+  `$RENEWED_LINEAGE`; the daily `tls-check` cron must reload httpd.
+- Drop `X-XSS-Protection`.
+- **`production-schedule.yml` stays until go-live** (decided 2026-11-03): the site
+  is in development, so production may sleep nightly and at weekends. mccarthy
+  deleted it on 2026-10-01 (`dd92698`) because its site went live. At go-live,
+  delete it and take mccarthy's matching edits to `dump-production-db.yml`'s
+  state-check text, the README and runbook step 10.
+- Not ported on purpose: the 256M PHP upload limit (mccarthy's cover-import
+  ZIPs) and HSTS `max-age=86400` (mccarthy's post-go-live step).
 
 ### Decide before step 0: domain, public IP, and repo visibility
 
@@ -41,8 +80,8 @@ schedule workflow at once, create the `production` and `dev` environments).
 - **Public IP.** Recommended: a hand-made, `CanNotDelete`-locked
   `volumes-production-pip` in `volumes-production-rg`, as mccarthy production
   has used since 2026-09-24, so DNS survives any rebuild. Runbook step 7.
-- **Is volumes-infra public?** mccarthy-infra is. Everything here is written to
-  be safe in a public repo, so this is a preference, not a blocker.
+- **Is volumes-infra public?** Yes — the repo was created public. Everything
+  here is written to be safe in a public repo.
 
 ### The app repo is private — the build's checkout path has never run
 
@@ -162,8 +201,10 @@ Read the mccarthy-infra entry before changing any of these.
 - **Production never reads its own boot log.** Only the dev deploy scans
   `cloud-init-output.log`.
 - **OIT tag drift.** OIT's CostCenter policy and Event Grid auto-tagging write
-  tags Terraform does not know about; every plan will try to strip them. Fix is
-  `lifecycle { ignore_changes = [tags] }` (or per key) on tagged resources.
+  tags Terraform does not know about; every plan would try to strip them.
+  Fixed as in mccarthy-infra PR #8: per-key `ignore_changes` on every tagged
+  resource in `modules/` and `environments/secrets`. Still open:
+  `azurerm_storage_account.private_files` in `environments/production`.
 - **RBAC Administrator on `volumes-secrets-rg` has no condition.** The CI SP
   could grant itself anything there. Add the standard "no Owner / UAA / RBAC
   Administrator" condition.
@@ -178,7 +219,5 @@ Read the mccarthy-infra entry before changing any of these.
 - **MaxSurge deploys are not fully zero-downtime.** ~46 s of intermittent HTTPS
   failures when the surge instance joins the load balancer (lib-main,
   2026-10-07).
-- **azurerm 4.81 misreads `runbook_type`**, forcing a phantom replacement of the
-  automation runbook on every devtest plan. Re-test on provider upgrades.
 - **`DefenderForStorageSettings/current` must be imported**, never created, on
   devtest and on the production private-files account. Runbook steps 5 and 7.
