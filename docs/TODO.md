@@ -26,50 +26,42 @@ Look there before "fixing" something that looks odd.
 
 **Resume here:** runbook step 0 (the repo is created and pushed; disable the
 schedule workflow at once and create the `production` and `dev` environments),
-after syncing with mccarthy-infra's
-fixes since `283390b` — see the first entry under Open.
+now that the
+mccarthy-infra sync is done (first entry under Open).
 
 ---
 
 ## Open
 
-### Sync with mccarthy-infra fixes made after `283390b`
+### mccarthy-infra is synced to `932ac41` (2026-11-03) — what was left out on purpose
 
-This repo was copied from mccarthy-infra `283390b`; mccarthy-infra was at
-`932ac41` on 2026-11-03. The commits in between are brought over in two PRs.
-Done in the first: OIT tag `ignore_changes` on `modules/` and
-`environments/secrets` (PR #8), the automation runbook on the PowerShell-7.2
-runtime environment plus the `ResourceGroupName` fix (PR #9), and dropping the inert
-`$settings['file_default_scheme']` from the Packer `environment.php`.
+Everything mccarthy-infra changed after the `283390b` copy outside `docs/` is
+here, except for the three things below. The next sync starts from `932ac41`:
+`git diff 932ac41..HEAD` in mccarthy-infra, minus `docs/`.
 
-Still to port, none of it applies cleanly because this repo diverged there:
-
-- **Install-vs-update guard** (`ccb1a10`, PR #10). `/opt/drupal-init.sh` decides
-  "installed" with `drush status`; a database Drupal cannot boot falls through
-  to `site:install`, which drops every table. mccarthy counts tables with
-  `sql:query` instead and refuses to guess. Same commit: `pipefail`, no
-  `grep -q` under it, and a fatal `updatedb`.
-- **Admin password out of `custom_data`.** Pass the Key Vault secret name, not
-  the password; `fetch-secrets.sh` writes it to a root-only file.
-- **Gallery publish** (PR #7). Packer's own publish fails on the transient state
-  OIT auto-tagging leaves a new managed image in. Needs
-  `.github/scripts/gallery-publish.sh`, the new steps in
-  `build-on-dispatch.yml`, and removing `shared_image_gallery_destination` from
-  the Packer source — these three go together.
-- **Container SAS for media** in `environments/production` (the account SAS also
-  reads the `tls-certs` container, private key included).
-- `azurerm_storage_account.private_files` needs the OIT tag `ignore_changes`.
-- `ProxyTimeout 300` on the `127.0.0.1:8008` backend vhost, both cloud-inits.
-- TLS: the renewal hook reads `$RENEWED_DOMAINS` (a list) — use
-  `$RENEWED_LINEAGE`; the daily `tls-check` cron must reload httpd.
-- Drop `X-XSS-Protection`.
 - **`production-schedule.yml` stays until go-live** (decided 2026-11-03): the site
   is in development, so production may sleep nightly and at weekends. mccarthy
   deleted it on 2026-10-01 (`dd92698`) because its site went live. At go-live,
   delete it and take mccarthy's matching edits to `dump-production-db.yml`'s
   state-check text, the README and runbook step 10.
-- Not ported on purpose: the 256M PHP upload limit (mccarthy's cover-import
-  ZIPs) and HSTS `max-age=86400` (mccarthy's post-go-live step).
+- **The 256M PHP upload limit** (mccarthy `6150cb0`, in `playbook.yml`). It
+  exists for mccarthy's cover-import ZIPs, up to ~167 MB. The base image's pool
+  caps uploads at 64M. Take it if volumes needs bigger uploads.
+- **HSTS `max-age=86400`.** mccarthy ramps it after go-live: 300, then a day,
+  then a year. Volumes stays at 300 until it is live.
+
+Two new things that came with the sync, and have only been tested offline:
+
+- `/opt/drupal-init.sh` now decides install vs update from the database's table
+  count (mccarthy PR #10) and reads the admin password from a root-only file
+  written by `fetch-secrets.sh`, not from `custom_data`. Tested 2026-11-03
+  against a stubbed `drush` for six states (query fails, non-numeric count,
+  tables with `updatedb` ok / failing, empty DB with and without the password
+  file). Not tested on a real VM: the first production apply does that.
+- Packer no longer publishes to the gallery; `gallery-publish.sh` does, after a
+  `check-version-free` step before the build. The first real dispatch tests it.
+  It exists because Packer's own publish failed 2 of 2 builds upstream on
+  2026-10-20.
 
 ### Decide before step 0: domain, public IP, and repo visibility
 
