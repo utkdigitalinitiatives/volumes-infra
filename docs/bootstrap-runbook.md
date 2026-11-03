@@ -21,7 +21,7 @@ order that actually works there, not the order they were first written in.
 | 7. `environments/production` | not started |
 | 8. Harden state account | not started |
 | 9. App repo wiring | not started |
-| 10. No start/stop schedule | n/a — workflow removed |
+| 10. Re-enable schedule | not started |
 
 **Nothing in this repository has ever run.** mccarthy-infra's first three
 dispatches each failed on a different latent defect — OIDC subject format,
@@ -62,6 +62,14 @@ Public or private is a real choice. mccarthy-infra is public, and everything
 here is written as if this repo is too: no secrets in git, tfvars ignored, the
 DB dump goes to private blob storage rather than an artifact. Private loses
 nothing.
+
+**Disable the schedule right after the first push.** `production-schedule.yml`
+has a cron, and GitHub starts running it as soon as it lands on `main` —
+against resources that do not exist yet.
+
+```bash
+gh workflow disable "Production Start/Stop Schedule" --repo utkdigitalinitiatives/volumes-infra
+```
 
 **Create the environments with a reviewer before anything can dispatch.**
 GitHub auto-creates a missing environment on first use **with no protection
@@ -356,25 +364,25 @@ state. In order:
    `production` environment has a required reviewer.
 5. App-side gaps: `az_blob_fs` + `key`, the PHP platform pin, `automated_cron`.
 
-## 10. No start/stop schedule
+## 10. Re-enable the scheduled workflow
 
-Production runs all the time. mccarthy-infra deallocated it overnight and at
-weekends with `production-schedule.yml` until 2026-10-01, then deleted that
-workflow because a public site cannot go dark every evening. This repo never had
-it live: it was removed from the scaffold before the first run. Do not bring it
-back for production.
+Once production is applied:
 
-Every workflow is event-triggered or manual, so nothing fires before the app
-repo exists.
+```bash
+gh workflow enable "Production Start/Stop Schedule"
+```
 
----|---|---|
+| Cron (UTC) | Action | Eastern |
+|---|---|---|
 | `30 11 * * 1-5` | start | 07:30 EDT / 06:30 EST |
 | `30 22 * * 1-5` | stop | 18:30 EDT / 17:30 EST |
 
 GitHub cron is always UTC, so the local window shifts an hour across DST.
 Weekdays only: production is off from Friday evening until Monday morning.
-Disable the workflow for good once the site is public-facing — mccarthy did on
-2026-10-01, before its go-live.
+The schedule stays on while the site is in development. At go-live, delete
+`production-schedule.yml`, as mccarthy did on 2026-10-01 (`dd92698`): a public
+site cannot go dark every evening. Then update `dump-production-db.yml`'s
+state-check comments and error text, the README, and this step.
 
 `ACTION` falls through to `stop` for any trigger that is not the start cron, so
 editing the start cron string without also editing the `ACTION` expression
@@ -404,6 +412,7 @@ The bootstrap is done when:
 |---|---|
 | Stale `image_version` | Guarded: no default, not in tfvars, and a `check` block warns when it is not the newest. Still pass the *running* version on a manual apply. |
 | Cross-node DB ceremony | With MaxSurge, two VMSS instances can run `drush updatedb` / `config:import` against the same database at once. Fine for additive changes; serialise with `pg_advisory_lock` before the first breaking schema change. |
+| Auto-stop wake-up race | The nightly deallocate means a cold boot re-runs the cloud-init ceremony. Same fix as above. |
 | Media SAS expiry | `media_sas_expiry` is a hard date (`2028-01-01`). Media stops being served when it lapses. Put it on a calendar. |
 | Base image drift | The shared base is rebuilt monthly by lib-main-infra. Set `BASE_IMAGE_VERSION` to pin. |
 | PostgreSQL major changes | Change `PG_MAJOR` and the Terraform default together. It pins both the server and the runner's `pg_dump`. |

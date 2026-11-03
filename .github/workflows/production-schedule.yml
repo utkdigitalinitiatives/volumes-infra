@@ -1,0 +1,102 @@
+name: Production Start/Stop Schedule
+
+# Cost control: production is deallocated overnight and at weekends.
+#
+# Disable this workflow (Actions tab > this workflow > Disable) once the site is
+# genuinely public-facing. Until then it roughly halves compute spend.
+
+on:
+  schedule:
+    # 6:30 AM EST (7:30 AM EDT) - start resources (Mon-Fri)
+    - cron: '30 11 * * 1-5'
+    # 5:30 PM EST (6:30 PM EDT) - stop resources (Mon-Fri)
+    - cron: '30 22 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - start
+          - stop
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  schedule:
+    name: ${{ (github.event_name == 'workflow_dispatch' && inputs.action) || (github.event.schedule == '30 11 * * 1-5' && 'start') || 'stop' }} production
+    runs-on: ubuntu-latest
+    env:
+      ACTION: ${{ (github.event_name == 'workflow_dispatch' && inputs.action) || (github.event.schedule == '30 11 * * 1-5' && 'start') || 'stop' }}
+      PROD_RG: ${{ vars.PROJECT_NAME }}-production-rg
+      PSQL_NAME: ${{ vars.PROJECT_NAME }}-production-psql
+      VMSS_NAME: ${{ vars.PROJECT_NAME }}-production-vmss
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Start PostgreSQL
+        if: env.ACTION == 'start'
+        run: |
+          # Retry: the Azure API returns transient GatewayTimeouts against a
+          # deallocated Flexible Server.
+          STATE=""
+          for attempt in {1..5}; do
+            STATE=$(az postgres flexible-server show \
+              --resource-group "$PROD_RG" --name "$PSQL_NAME" \
+              --query state -o tsv 2>&1) && break
+            echo "Failed to query PostgreSQL state (attempt $attempt/5): $STATE"
+            sleep 15
+          done
+
+          if [ -z "$STATE" ] || echo "$STATE" | grep -qi "error"; then
+            echo "::error::Unable to query PostgreSQL server state after 5 attempts: $STATE"
+            exit 1
+          fi
+
+          if [ "$STATE" = "Stopped" ]; then
+            az postgres flexible-server start --resource-group "$PROD_RG" --name "$PSQL_NAME"
+          else
+            echo "PostgreSQL is already in state: $STATE"
+          fi
+
+      - name: Start VMSS
+        if: env.ACTION == 'start'
+        run: |
+          az vmss start --resource-group "$PROD_RG" --name "$VMSS_NAME" --instance-ids '*'
+
+      - name: Stop VMSS
+        if: env.ACTION == 'stop'
+        run: |
+          az vmss deallocate --resource-group "$PROD_RG" --name "$VMSS_NAME" --instance-ids '*'
+
+      - name: Stop PostgreSQL
+        if: env.ACTION == 'stop'
+        run: |
+          STATE=""
+          for attempt in {1..5}; do
+            STATE=$(az postgres flexible-server show \
+              --resource-group "$PROD_RG" --name "$PSQL_NAME" \
+              --query state -o tsv 2>&1) && break
+            echo "Failed to query PostgreSQL state (attempt $attempt/5): $STATE"
+            sleep 15
+          done
+
+          if [ -z "$STATE" ] || echo "$STATE" | grep -qi "error"; then
+            echo "::error::Unable to query PostgreSQL server state after 5 attempts: $STATE"
+            exit 1
+          fi
+
+          if [ "$STATE" = "Ready" ]; then
+            az postgres flexible-server stop --resource-group "$PROD_RG" --name "$PSQL_NAME"
+          else
+            echo "PostgreSQL is already in state: $STATE"
+          fi

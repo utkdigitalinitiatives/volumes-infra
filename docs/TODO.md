@@ -24,8 +24,9 @@ Look there before "fixing" something that looks odd.
 | First-boot install identity, asked for by a volumes dev 2026-10-14: site name `Volumes \| UTK Libraries`, site and super-user mail `librarieswebsite@utk.edu`, super user `admin` | done as `drupal_site_name` / `drupal_site_mail` / `drupal_admin_username` / `drupal_admin_mail` in `environments/production`; rendered `site:install` line checked, validations tested. Not yet reported back to the dev. |
 | Everything else | never run — see `docs/bootstrap-runbook.md` |
 
-**Resume here:** runbook step 0 (the repo is created and pushed; the `production`
-and `dev` environments are the part left), after syncing with mccarthy-infra's
+**Resume here:** runbook step 0 (the repo is created and pushed; disable the
+schedule workflow at once and create the `production` and `dev` environments),
+after syncing with mccarthy-infra's
 fixes since `283390b` — see the first entry under Open.
 
 ---
@@ -38,8 +39,7 @@ This repo was copied from mccarthy-infra `283390b`; mccarthy-infra was at
 `932ac41` on 2026-11-03. The commits in between are brought over in two PRs.
 Done in the first: OIT tag `ignore_changes` on `modules/` and
 `environments/secrets` (PR #8), the automation runbook on the PowerShell-7.2
-runtime environment plus the `ResourceGroupName` fix (PR #9), deletion of
-`production-schedule.yml` (mccarthy `dd92698`), and dropping the inert
+runtime environment plus the `ResourceGroupName` fix (PR #9), and dropping the inert
 `$settings['file_default_scheme']` from the Packer `environment.php`.
 
 Still to port, none of it applies cleanly because this repo diverged there:
@@ -63,6 +63,11 @@ Still to port, none of it applies cleanly because this repo diverged there:
 - TLS: the renewal hook reads `$RENEWED_DOMAINS` (a list) — use
   `$RENEWED_LINEAGE`; the daily `tls-check` cron must reload httpd.
 - Drop `X-XSS-Protection`.
+- **`production-schedule.yml` stays until go-live** (decided 2026-11-03): the site
+  is in development, so production may sleep nightly and at weekends. mccarthy
+  deleted it on 2026-10-01 (`dd92698`) because its site went live. At go-live,
+  delete it and take mccarthy's matching edits to `dump-production-db.yml`'s
+  state-check text, the README and runbook step 10.
 - Not ported on purpose: the 256M PHP upload limit (mccarthy's cover-import
   ZIPs) and HSTS `max-age=86400` (mccarthy's post-go-live step).
 
