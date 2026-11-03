@@ -291,36 +291,23 @@ module "blob_storage" {
 # plan and would reissue the SAS (and reimage the VMSS) on each apply. The
 # tradeoff is that expiry is a hard date somebody must roll before it lapses:
 # put a calendar reminder on media_sas_expiry.
-data "azurerm_storage_account_sas" "media_read" {
+#
+# Scoped to the media container. The account holds tls-certs too, private key
+# included, and an account SAS would read it.
+data "azurerm_storage_account_blob_container_sas" "media_read" {
   connection_string = module.blob_storage.primary_connection_string
+  container_name    = module.blob_storage.container_name
   https_only        = true
   start             = var.media_sas_start
   expiry            = var.media_sas_expiry
 
-  resource_types {
-    service   = false
-    container = false
-    object    = true
-  }
-
-  services {
-    blob  = true
-    queue = false
-    table = false
-    file  = false
-  }
-
   permissions {
-    read    = true
-    write   = false
-    delete  = false
-    list    = false
-    add     = false
-    create  = false
-    update  = false
-    process = false
-    tag     = false
-    filter  = false
+    read   = true
+    add    = false
+    create = false
+    write  = false
+    delete = false
+    list   = false
   }
 }
 
@@ -388,6 +375,16 @@ resource "azurerm_storage_account" "private_files" {
   }
 
   tags = local.common_tags
+
+  lifecycle {
+    ignore_changes = [
+      # OIT governance owns these tags: a CostCenter policy (modify) and Event
+      # Grid auto-tagging on every create/update. Ours still apply on create.
+      tags["CostCenter"],
+      tags["CreatorUPN"], tags["CreatorName"], tags["CreatorObjectID"], tags["CreationTimeStamp"],
+      tags["LastModifierUPN"], tags["LastModifierName"], tags["LastModifierObjectID"], tags["LastModifiedTimeStamp"],
+    ]
+  }
 }
 
 resource "azurerm_storage_share" "drupal_private" {
@@ -491,13 +488,13 @@ module "vmss" {
     # Escape % so mod_rewrite doesn't interpret %2B / %2F / %3D as backreferences (%N).
     # The escaped \% becomes a literal % in the substitution; combined with [NE] flag
     # in the RewriteRule and proxy-nocanon env, the SAS reaches Azure verbatim.
-    storage_sas_token      = replace(data.azurerm_storage_account_sas.media_read.sas, "%", "\\%")
-    lb_fqdn                = module.load_balancer.public_ip_fqdn
-    drupal_admin_password  = var.drupal_admin_password != null ? var.drupal_admin_password : random_password.drupal_admin.result
-    drupal_site_uuid       = var.drupal_site_uuid
-    domain_name            = var.domain_name
-    enable_https           = var.enable_https
-    anubis_key_secret_name = azurerm_key_vault_secret.anubis_signing_key.name
+    storage_sas_token                 = replace(data.azurerm_storage_account_blob_container_sas.media_read.sas, "%", "\\%")
+    lb_fqdn                           = module.load_balancer.public_ip_fqdn
+    drupal_admin_password_secret_name = azurerm_key_vault_secret.drupal_admin_password.name
+    drupal_site_uuid                  = var.drupal_site_uuid
+    domain_name                       = var.domain_name
+    enable_https                      = var.enable_https
+    anubis_key_secret_name            = azurerm_key_vault_secret.anubis_signing_key.name
     # Postmark server "Libraries Website", for Drupal's own mail. Seeded by
     # hand so the token stays out of TF state. Deploy mail from the workflows
     # uses a different server ("DevOps", shared-postmark-api-token).

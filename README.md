@@ -5,7 +5,7 @@ Infrastructure as Code for the `volumes` Drupal site ("Volumes | UTK Libraries")
 **Status: scaffolded, never run.** Nothing exists in Azure yet, no pipeline has
 executed. The repository is on GitHub (public), with the scaffold committed
 on 2026-11-02 as `f46b550`. It was built on 2026-10-14 from [mccarthy-infra](https://github.com/utkdigitalinitiatives/mccarthy-infra)
-at commit `283390b`. See [docs/bootstrap-runbook.md](docs/bootstrap-runbook.md)
+at commit `283390b`, and synced with its fixes up to `932ac41` on 2026-11-03. See [docs/bootstrap-runbook.md](docs/bootstrap-runbook.md)
 for how to stand it up and [docs/TODO.md](docs/TODO.md) for what is open.
 
 Every first run in mccarthy-infra failed on a different latent defect, eight in
@@ -141,6 +141,7 @@ authoritative source, not this table.
 volumes-infra/
 ├── .github/
 │   ├── scripts/packer-cleanup.sh  # shared with lib-main-infra
+│   ├── scripts/gallery-publish.sh # publish the Packer managed image to the gallery, with wait and retry
 │   └── workflows/
 │       ├── build-on-dispatch.yml      # drupal-dev-merge  -> build image, sync DB+blobs, deploy dev VM
 │       ├── deploy-on-main-merge.yml   # drupal-main-merge -> production rolling deploy, destroy dev VM

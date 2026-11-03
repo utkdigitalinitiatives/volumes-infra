@@ -44,19 +44,10 @@ source "azure-arm" "app" {
     plan_publisher = "resf"
   }
 
-  # Output to the shared Compute Gallery under THIS project's image definition
-  shared_image_gallery_destination {
-    subscription         = var.subscription_id
-    resource_group       = var.gallery_resource_group_name
-    gallery_name         = var.gallery_name
-    image_name           = var.image_name
-    image_version        = var.image_version
-    replication_regions  = var.replication_regions
-    storage_account_type = "Standard_LRS"
-  }
-
-  # Managed image configuration (intermediate). Project-prefixed so it cannot
-  # collide with lib-main's intermediate images in the shared resource group.
+  # Output is a managed image only. The workflow publishes it to the gallery with
+  # .github/scripts/gallery-publish.sh, which waits and retries where Packer's own
+  # gallery publish cannot - see that script for why. Project-prefixed so it
+  # cannot collide with lib-main's intermediate images in the shared resource group.
   managed_image_resource_group_name = var.gallery_resource_group_name
   managed_image_name                = "${var.site_name}-rocky9-${var.image_version}"
 

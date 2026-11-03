@@ -211,6 +211,14 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Using base image version: $VERSION"
 
+      # Packer only makes a managed image, so nothing else would notice a taken
+      # version name until the publish step. Check before the build, not after it.
+      - name: Check the gallery version is free
+        run: |
+          .github/scripts/gallery-publish.sh check-version-free \
+            "${{ vars.GALLERY_RESOURCE_GROUP }}" "${{ vars.GALLERY_NAME }}" \
+            "${{ vars.APP_IMAGE_NAME }}" "${{ steps.version.outputs.version }}"
+
       # This repo passes build_resource_group_name, so Packer builds inside an
       # existing RG. A cancelled build therefore leaks loose pkrvm/pkrni/pkros
       # resources - a build VM that keeps billing - with no pkr-* group to find.
@@ -253,11 +261,28 @@ jobs:
             -var "drupal_sha=$DRUPAL_SHA" \
             .
 
-      # Packer always leaves an intermediate managed image behind on the way to the
-      # gallery version. Nothing ever boots it, so delete it here - the published
-      # gallery version keeps its own copy. This repo cleans up after its own
-      # builds rather than relying on lib-main-infra's monthly sweep, so the
-      # cleanup lives and dies with the builds that create the mess.
+      # The ARM token from the first login lasts about an hour and az cannot renew
+      # it: the GitHub OIDC token it would present again expires 5 minutes after
+      # login (AADSTS700024). The build plus a ~8 minute publish can outlast it.
+      - name: Azure CLI Login (refresh for publish)
+        uses: azure/login@v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Publish to the gallery
+        run: |
+          .github/scripts/gallery-publish.sh publish \
+            "${{ vars.GALLERY_RESOURCE_GROUP }}" "${{ vars.GALLERY_NAME }}" \
+            "${{ vars.APP_IMAGE_NAME }}" "${{ steps.version.outputs.version }}" \
+            "${{ vars.PROJECT_NAME }}-rocky9-${{ steps.version.outputs.version }}" "${{ vars.LOCATION }}"
+
+      # The managed image is only the publish source. Nothing ever boots it, so
+      # delete it once the publish is done or has failed - the gallery version
+      # keeps its own copy. This repo cleans up after its own builds rather than
+      # relying on lib-main-infra's monthly sweep, so the cleanup lives and dies
+      # with the builds that create the mess.
       - name: Delete intermediate managed image
         if: always()
         run: |
